@@ -5,7 +5,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Captain Hook Bot is LIVE!", 200
+    return "Captain Hook Bot is LIVE!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -16,4 +16,3 @@ def webhook():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
