@@ -33,7 +33,11 @@ def parse(data):
                 continue
 
             league_id = item.get("relationships",{}).get("league",{}).get("data",{}).get("id")
-            league_name = leagues.get(league_id, "UNK")
+            league_name = leagues.get(league_id, "").upper()
+
+            # BLOCK NFL / CFB - SOCCER ONLY
+            if "NFL" in league_name or "CFB" in league_name or "NCAAF" in league_name or "FOOTBALL" in league_name:
+                continue
 
             _id = item["id"]
             pid = item.get("relationships",{}).get("new_player",{}).get("data",{}).get("id")
@@ -50,10 +54,10 @@ def send(msg):
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
 
 def main():
-    print("Captain Hook - Passes Attempted w/ League Tag")
+    print("Captain Hook - SOCCER Passes Attempted ONLY")
     seen = parse(fetch())
-    print(f"Initial tracking {len(seen)} passes lines")
-    send(f"✅ Hook live: Tracking {len(seen)} Passes Attempted lines [NFL + SOCCER]. Will show league tag.")
+    print(f"Initial tracking {len(seen)} SOCCER passes lines - NFL BLOCKED")
+    send(f"✅ Hook live: Tracking {len(seen)} SOCCER Passes Attempted ONLY. NFL blocked.")
 
     while True:
         time.sleep(60)
@@ -61,11 +65,11 @@ def main():
             cur = parse(fetch())
             for _id, info in cur.items():
                 if _id not in seen:
-                    send(f"🆕 NEW: {info['name']} {info['line']} Passes Attempted [{info['league']}]")
+                    send(f"🆕 NEW SOCCER PASS: {info['name']} {info['line']} [{info['league']}]")
                 elif info["line"] != seen[_id]["line"]:
-                    send(f"📈 BUMP: {info['name']} {seen[_id]['line']} -> {info['line']} Passes Attempted [{info['league']}]")
+                    send(f"📈 BUMP SOCCER: {info['name']} {seen[_id]['line']} -> {info['line']} [{info['league']}]")
             seen = cur
-            print(f"Checked {len(cur)} passes lines")
+            print(f"Checked {len(cur)} soccer lines")
         except Exception as e:
             print(f"Error {e}")
             time.sleep(5)
