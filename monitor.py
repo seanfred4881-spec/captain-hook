@@ -26,10 +26,12 @@ def parse(data):
         if inc.get("type") == "league":
             leagues[inc["id"]] = inc["attributes"].get("name","")
         if inc.get("type") == "game":
-            # game has the match name + start time
+            attrs = inc["attributes"]
+            # Try every possible name field
+            name = attrs.get("name") or attrs.get("description") or attrs.get("label") or "Soccer Match"
             games[inc["id"]] = {
-                "name": inc["attributes"].get("name") or inc["attributes"].get("description") or "Soccer Match",
-                "start": inc["attributes"].get("start_time") or inc["attributes"].get("game_time") or ""
+                "name": name,
+                "start": attrs.get("start_time") or attrs.get("game_time") or attrs.get("starts_at") or ""
             }
 
     cur = {}
@@ -46,7 +48,7 @@ def parse(data):
                 continue
 
             game_id = item.get("relationships",{}).get("game",{}).get("data",{}).get("id")
-            game_info = games.get(game_id, {"name": league_name or "SOCCER", "start": ""})
+            game_info = games.get(game_id, {"name": league_name.title() or "Soccer Match", "start": ""})
 
             _id = item["id"]
             pid = item.get("relationships",{}).get("new_player",{}).get("data",{}).get("id")
@@ -76,23 +78,27 @@ def send_grouped_embeds(new_props):
     if not WEBHOOK_URL or not new_props:
         return
 
-    # Group by game
     grouped = defaultdict(list)
     for info in new_props:
         grouped[info["game_name"]].append(info)
 
     for game_name, props in grouped.items():
         start_str = format_start_time(props[0].get("game_start",""))
-
-        # Build description like friend format
         lines_text = "\n".join([f"{p['name']} — Passes `{p['line']}`" for p in props])
 
         embed = {
             "title": "🚨 PrizePicks — SOCCER PASSES ARE UP",
-            "description": f"**{game_name}**\n{lines_text}\n\n**Starts**\n{start_str}",
-            "color": 3092790, # PrizePicks green/gray
+            "description": f"**{game_name}**\n{lines_text}",
+            "color": 3066993, # green
+            "fields": [
+                {
+                    "name": "Starts",
+                    "value": start_str,
+                    "inline": False
+                }
+            ],
             "footer": {
-                "text": f"PrizePicks • {len(props)} prop(s) | Today at {datetime.now().strftime('%-I:%M %p')}"
+                "text": f"PrizePicks • {len(props)} prop(s)"
             },
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -104,10 +110,11 @@ def send_grouped_embeds(new_props):
         requests.post(WEBHOOK_URL, json=payload, timeout=10)
 
 def main():
-    print("Captain Hook - SOCCER Passes Attempted ONLY - EMBED MODE")
+    print("Captain Hook - SOCCER Passes Attempted ONLY - EMBED MODE V2")
     seen = parse(fetch())
-    print(f"Initial tracking {len(seen)} SOCCER passes lines")
-    requests.post(WEBHOOK_URL, json={"content": f"✅ Hook live: Tracking {len(seen)} SOCCER Passes ONLY. New Box Format."}, timeout=10)
+    print(f"Initial tracking {len(seen)} SOCCER passes lines - NFL BLOCKED")
+    if WEBHOOK_URL:
+        requests.post(WEBHOOK_URL, json={"content": f"✅ Hook V2 live: Tracking {len(seen)} SOCCER Passes ONLY. Box format fixed."}, timeout=10)
 
     while True:
         time.sleep(60)
@@ -118,10 +125,10 @@ def main():
                 if _id not in seen:
                     new_to_send.append(info)
                 elif info["line"]!= seen[_id]["line"]:
-                    # treat bump as new too
-                    info["name"] = f"📈 {info['name']} {seen[_id]['line']} -> {info['line']}"
-                    info["line"] = info["line"] # keep new line
-                    new_to_send.append(info)
+                    # line bump
+                    copy = info.copy()
+                    copy["name"] = f"📈 {info['name']} {seen[_id]['line']} -> {info['line']}"
+                    new_to_send.append(copy)
 
             if new_to_send:
                 send_grouped_embeds(new_to_send)
