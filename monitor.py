@@ -1,7 +1,6 @@
 import requests
 import time
 import os
-import random
 
 POLL_SECONDS = 60
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -12,9 +11,8 @@ URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
     "Origin": "https://app.prizepicks.com",
     "Referer": "https://app.prizepicks.com/",
 }
@@ -22,30 +20,22 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
-PROXY_URL = os.getenv("PROXY_URL")
-if PROXY_URL:
-    session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-
 def fetch():
-    last_err = None
     for url in URLS:
-        try:
-            r = session.get(url, timeout=20)
-            if r.status_code == 403:
-                print(f"Got 403 on {url[:40]}")
-                last_err = "403"
-                continue
-            r.raise_for_status()
+        r = session.get(url, timeout=20)
+        print(f"FETCH {url[:50]} -> {r.status_code} len={len(r.text)}")
+        if r.status_code == 200:
             return r.json()
-        except Exception as e:
-            last_err = e
-            print(f"Fetch fail: {e}")
-            time.sleep(2)
-    raise Exception(last_err or "All fetch failed")
+    raise Exception("All URLs failed")
 
 def parse(data):
+    print(f"DEBUG keys: {list(data.keys())}")
+    print(f"DEBUG data len: {len(data.get('data', []))}")
+    print(f"DEBUG included len: {len(data.get('included', []))}")
+    if data.get('data'):
+        print(f"DEBUG first item: {str(data['data'][0])[:500]}")
+
     cur = {}
-    # Prizepicks puts player names in "included"
     players = {}
     for inc in data.get("included", []):
         if inc.get("type") == "new_player":
@@ -56,15 +46,16 @@ def parse(data):
             _id = item["id"]
             attrs = item["attributes"]
             rel = item.get("relationships", {}).get("new_player", {}).get("data", {})
-            player_id = rel.get("id")
-            name = players.get(player_id, "Unknown")
+            player_id = rel.get("id") if isinstance(rel, dict) else None
+            name = players.get(player_id, "Unknown") if player_id else attrs.get("description", "Unknown")
 
             cur[_id] = {
                 "name": name,
                 "desc": attrs.get("stat_display_name", ""),
                 "line": attrs.get("line_score", 0)
             }
-        except:
+        except Exception as e:
+            print(f"parse error: {e}")
             continue
     return cur
 
@@ -84,17 +75,11 @@ def main():
     while True:
         try:
             cur = parse(fetch())
-            backoff = POLL_SECONDS
+            print(f"Initial: {len(cur)} lines tracked")
             if seen is None:
-                print(f"Initial: {len(cur)} lines tracked")
                 send(f"✅ Captain Hook live. Tracking {len(cur)} lines.")
-            else:
-                for _id, info in cur.items():
-                    if _id not in seen:
-                        send(f"🆕 NEW: {info['name']} - {info['desc']} {info['line']}")
-                    elif info["line"] != seen[_id]["line"]:
-                        send(f"📈 MOVE: {info['name']} {seen[_id]['line']} -> {info['line']}")
             seen = cur
+            backoff = POLL_SECONDS
         except Exception as e:
             print(f"Error: {e}")
             backoff = min(backoff * 2, 900)
