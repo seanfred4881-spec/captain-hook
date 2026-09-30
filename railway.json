@@ -1,0 +1,6 @@
+{
+  "deploy": {
+    "startCommand": "python monitor.py",
+    "restartPolicyType": "ALWAYS"
+  }
+}
