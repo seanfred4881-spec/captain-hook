@@ -1,4 +1,0 @@
-Flask
-gunicorn
-discord.py
-requests
