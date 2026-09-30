@@ -6,7 +6,6 @@ import random
 POLL_SECONDS = 60
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Try partner API first, it's less blocked
 URLS = [
     "https://partner-api.prizepicks.com/projections?per_page=250&single_stat=true&state_code=MA&game_mode=pickem",
     "https://api.prizepicks.com/projections?per_page=250&single_stat=true",
@@ -18,23 +17,14 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://app.prizepicks.com",
     "Referer": "https://app.prizepicks.com/",
-    "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# Optional: add a proxy if you have one. 
-# In Railway -> Variables -> Add PROXY_URL = http://user:pass@ip:port
 PROXY_URL = os.getenv("PROXY_URL")
 if PROXY_URL:
     session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-    print(f"Using proxy: {PROXY_URL[:20]}...")
 
 def fetch():
     last_err = None
@@ -42,4 +32,78 @@ def fetch():
         try:
             r = session.get(url, timeout=20)
             if r.status_code == 403:
-                print(f"403 on
+                print("Got 403, trying next URL")
+                last_err = "403 blocked"
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            print(f"Fail: {e}")
+            time.sleep(2)
+
+    if not PROXY_URL:
+        print("Trying free proxy...")
+        try:
+            plist = requests.get("https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all", timeout=10).text.splitlines()
+            if plist:
+                proxy = random.choice(plist).strip()
+                print(f"Trying proxy {proxy}")
+                proxies = {"http": "http://" + proxy, "https": "http://" + proxy}
+                r = requests.get(URLS[0], headers=HEADERS, proxies=proxies, timeout=15)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            print(f"Proxy failed: {e}")
+
+    raise Exception(last_err)
+
+def parse(data):
+    cur = {}
+    for item in data.get("data", []):
+        try:
+            _id = item["id"]
+            attrs = item["attributes"]
+            cur[_id] = {
+                "name": attrs.get("new_player", {}).get("name", "Unknown"),
+                "desc": attrs.get("stat_display_name", ""),
+                "line": attrs.get("line_score", 0)
+            }
+        except:
+            continue
+    return cur
+
+def send(msg):
+    if not WEBHOOK_URL:
+        print(msg)
+        return
+    try:
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
+    except Exception as e:
+        print(f"Webhook fail: {e}")
+
+def main():
+    print("Monitor started - Captain Hook 1554656337005125693")
+    seen = None
+    backoff = POLL_SECONDS
+    while True:
+        try:
+            cur = parse(fetch())
+            backoff = POLL_SECONDS
+            if seen is None:
+                print(f"Initial: {len(cur)} lines tracked")
+                send(f"Live. Tracking {len(cur)} lines.")
+            else:
+                for _id, info in cur.items():
+                    if _id not in seen:
+                        send(f"NEW: {info['name']} - {info['desc']} {info['line']}")
+                    elif info["line"]!= seen[_id]["line"]:
+                        send(f"MOVE: {info['name']} {seen[_id]['line']} -> {info['line']}")
+            seen = cur
+        except Exception as e:
+            print(f"Error: {e}")
+            backoff = min(backoff * 2, 900)
+        time.sleep(backoff)
+
+if __name__ == "__main__":
+    main()
