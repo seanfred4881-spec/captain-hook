@@ -1,12 +1,6 @@
 import requests, time, os
 
-POLL_SECONDS = 60
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-URLS = [
-    "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem",
-]
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
@@ -16,68 +10,56 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
+URL = "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem"
+
 def fetch():
-    r = session.get(URLS[0], timeout=20)
-    print(f"FETCH -> {r.status_code} len={len(r.text)}")
-    j = r.json()
-    print(f"FOUND {len(j.get('data',[]))}")
-    return j
+    r = session.get(URL, timeout=20)
+    return r.json()
 
 def parse(data):
-    cur = {}
     players = {}
     for inc in data.get("included", []):
         if inc.get("type") == "new_player":
-            players[inc["id"]] = inc["attributes"].get("name")
+            players[inc["id"]] = inc["attributes"].get("name","Unknown")
+    cur = {}
     for item in data.get("data", []):
         try:
-            _id = item["id"]
             attrs = item["attributes"]
-            rel = item.get("relationships", {}).get("new_player", {}).get("data", {})
-            pid = rel.get("id") if isinstance(rel, dict) else None
-            name = players.get(pid, attrs.get("description","Unknown"))
-            cur[_id] = {"name": name, "desc": attrs.get("stat_display_name",""), "line": attrs.get("line_score",0)}
+            stat = str(attrs.get("stat_display_name","")).lower()
+            if "pass" not in stat or "attempt" not in stat:
+                continue
+            _id = item["id"]
+            pid = item.get("relationships",{}).get("new_player",{}).get("data",{}).get("id")
+            cur[_id] = {
+                "name": players.get(pid, attrs.get("description","Unknown")),
+                "line": attrs.get("line_score",0)
+            }
         except: continue
     return cur
 
 def send(msg):
-    print(f"DEBUG WEBHOOK_URL set? {bool(WEBHOOK_URL)} len={len(WEBHOOK_URL) if WEBHOOK_URL else 0}")
     if WEBHOOK_URL:
-        print(f"DEBUG WEBHOOK start: {WEBHOOK_URL[:35]}...")
-    if not WEBHOOK_URL:
-        print(f"WOULD SEND (no webhook): {msg}")
-        return
-    try:
-        resp = requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
-        print(f"DISCORD RESPONSE: {resp.status_code} - {resp.text[:200]}")
-    except Exception as e:
-        print(f"Webhook fail: {e}")
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
 
 def main():
-    print("Monitor started - Captain Hook 1554656337005125693")
-    if not WEBHOOK_URL:
-        print("!!! NO WEBHOOK_URL FOUND IN VARIABLES!!!")
-    else:
-        print(f"Webhook loaded: {WEBHOOK_URL[:35]}...")
+    print("Captain Hook - Passes Attempted ONLY")
+    seen = parse(fetch())
+    print(f"Initial tracking {len(seen)} passes lines")
+    send(f"✅ Hook live: Tracking {len(seen)} Passes Attempted lines. Will alert on NEW drops + BUMPS.")
 
-    cur = parse(fetch())
-    print(f"Initial: {len(cur)} lines tracked")
-    send(f"✅ Captain Hook live. Tracking {len(cur)} lines. Test @ 07:23 AM")
-
-    seen = cur
     while True:
-        time.sleep(POLL_SECONDS)
+        time.sleep(60)
         try:
             cur = parse(fetch())
             for _id, info in cur.items():
                 if _id not in seen:
-                    send(f"🆕 NEW: {info['name']} - {info['desc']} {info['line']}")
-                elif info["line"]!= seen[_id]["line"]:
-                    send(f"📈 MOVE: {info['name']} {seen[_id]['line']} -> {info['line']}")
+                    send(f"🆕 NEW PASS DROP: {info['name']} {info['line']} Passes Attempted")
+                elif info["line"] != seen[_id]["line"]:
+                    send(f"📈 BUMP: {info['name']} {seen[_id]['line']} -> {info['line']} Passes Attempted")
             seen = cur
-            print(f"Checked - still {len(cur)} lines")
+            print(f"Checked {len(cur)} passes lines")
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
