@@ -17,10 +17,13 @@ def fetch():
     return r.json()
 
 def parse(data):
-    players = {}
+    players, leagues = {}, {}
     for inc in data.get("included", []):
         if inc.get("type") == "new_player":
             players[inc["id"]] = inc["attributes"].get("name","Unknown")
+        if inc.get("type") == "league":
+            leagues[inc["id"]] = inc["attributes"].get("name","")
+
     cur = {}
     for item in data.get("data", []):
         try:
@@ -28,11 +31,16 @@ def parse(data):
             stat = str(attrs.get("stat_display_name","")).lower()
             if "pass" not in stat or "attempt" not in stat:
                 continue
+
+            league_id = item.get("relationships",{}).get("league",{}).get("data",{}).get("id")
+            league_name = leagues.get(league_id, "UNK")
+
             _id = item["id"]
             pid = item.get("relationships",{}).get("new_player",{}).get("data",{}).get("id")
             cur[_id] = {
                 "name": players.get(pid, attrs.get("description","Unknown")),
-                "line": attrs.get("line_score",0)
+                "line": attrs.get("line_score",0),
+                "league": league_name
             }
         except: continue
     return cur
@@ -42,10 +50,10 @@ def send(msg):
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
 
 def main():
-    print("Captain Hook - Passes Attempted ONLY")
+    print("Captain Hook - Passes Attempted w/ League Tag")
     seen = parse(fetch())
     print(f"Initial tracking {len(seen)} passes lines")
-    send(f"✅ Hook live: Tracking {len(seen)} Passes Attempted lines. Will alert on NEW drops + BUMPS.")
+    send(f"✅ Hook live: Tracking {len(seen)} Passes Attempted lines [NFL + SOCCER]. Will show league tag.")
 
     while True:
         time.sleep(60)
@@ -53,9 +61,9 @@ def main():
             cur = parse(fetch())
             for _id, info in cur.items():
                 if _id not in seen:
-                    send(f"🆕 NEW PASS DROP: {info['name']} {info['line']} Passes Attempted")
+                    send(f"🆕 NEW: {info['name']} {info['line']} Passes Attempted [{info['league']}]")
                 elif info["line"] != seen[_id]["line"]:
-                    send(f"📈 BUMP: {info['name']} {seen[_id]['line']} -> {info['line']} Passes Attempted")
+                    send(f"📈 BUMP: {info['name']} {seen[_id]['line']} -> {info['line']} Passes Attempted [{info['league']}]")
             seen = cur
             print(f"Checked {len(cur)} passes lines")
         except Exception as e:
