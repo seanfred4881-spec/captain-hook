@@ -1,49 +1,50 @@
-"""PrizePicks soccer 'Passes Attempted' alerts.
+"""PrizePicks soccer 'Passes Attempted
 Alerts (via Discord webhook) when:
-  1. A NEW Passes Attempted line is posted ("dropped")
-  2. An existing line MOVES (bumped up or down)
+    1. A NEW Passes Attempted line is po
+    2. An existing line MOVES (bumped up
 """
+
 import os
 import time
 import requests
+
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-LEAGUE_ID = os.getenv("LEAGUE_ID", "82")  # 82 = soccer (verify if it stops working)
-PROXY = os.getenv("PROXY_URL")  # optional, see README
-PLAYER_FILTER = [p.strip().lower() for p in os.getenv("PLAYERS", "").split(",") if p.strip()]
-URL = "https://api.prizepicks.com/projections"
+LEAGUE_ID = os.getenv("LEAGUE_ID", "82")
+PROXY = os.getenv("PROXY_URL")  # optional
+PLAYER_FILTER = [p.strip().lower() for p in os.getenv("PLAYER_FILTER", "").split(",") if p.strip()]
+URL = f"https://api.prizepicks.com/projections?league_id={LEAGUE_ID}&per_page=250&single_stat=true"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
-    "Referer": "https://app.prizepicks.com/",
     "Origin": "https://app.prizepicks.com",
+    "Referer": "https://app.prizepicks.com/"
 }
-def notify(msg: str):
-    try:
-        requests.post(WEBHOOK, json={"content": msg}, timeout=10)
-    except Exception as e:
-        print("notify failed:", e)
+
 def fetch():
-    params = {"league_id": LEAGUE_ID, "per_page": 250, "single_stat": "true"}
-    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
-    r = requests.get(URL, params=params, headers=HEADERS, proxies=proxies, timeout=20)
+    kwargs = {"headers": HEADERS, "timeout": 15}
+    if PROXY:
+        kwargs["proxies"] = {"http": PROXY, "https": PROXY}
+    r = requests.get(URL, **kwargs)
     r.raise_for_status()
     return r.json()
+
 def parse(data):
     players = {}
     for inc in data.get("included", []):
         if inc.get("type") == "new_player":
             a = inc["attributes"]
-            players[inc["id"]] = f'{a.get("display_name")} ({a.get("team", "?")})'
-  out = {}
+            players[inc["id"]] = f'{a.get("name")}'
+
+    out = {}
     for p in data.get("data", []):
         a = p["attributes"]
-        stat = (a.get("stat_type") or a.get("stat_display_name") or "").lower()
-        if "pass" not in stat or "attempt" not in stat:
+        stat = (a.get("stat_type") or "").lower()
+        if "pass" not in stat or "atte" not in stat:
             continue
         if a.get("odds_type", "standard") != "standard":
-            continue  # skip demons/goblins
+            continue
         pid = p["relationships"]["new_player"]["data"]["id"]
         name = players.get(pid, "Unknown")
         if PLAYER_FILTER and not any(f in name.lower() for f in PLAYER_FILTER):
@@ -51,41 +52,42 @@ def parse(data):
         out[p["id"]] = {
             "name": name,
             "line": float(a["line_score"]),
-            "start": a.get("start_time", ""),
-            "desc": a.get("description", ""),
+            "start": a.get("start_time"),
+            "desc": a.get("description", "Passes Attempted")
         }
-        return out
+    return out
+
+def send(msg):
+    requests.post(WEBHOOK, json={"content": msg}, timeout=10)
+
 def main():
-    seen = None
+    print("Monitor started - Captain Hook 1554656337005125693")
     backoff = POLL_SECONDS
-    print("Monitor started")
+
+    # FIX: Load first board silently so it doesn't spam 8x on start
+    try:
+        seen = parse(fetch())
+        print(f"Initial: {len(seen)} lines tracked")
+    except Exception as e:
+        print(f"Initial fetch failed: {e}")
+        seen = {}
+    
     while True:
         try:
-            current = parse(fetch())
-            backoff = POLL_SECONDS
-            if seen is None:
-                print(f"Seeded with {len(current)} lines (no alerts on first run)")
-                notify(f"✅ PrizePicks monitor is live. Tracking {len(current)} soccer Passes Attempted lines.")
-            else:
-                for pid, cur in current.items():
-                    old = seen.get(pid)
-                    if old is None:
-                        notify(f"🆕 **New line dropped**\n{cur['name']} vs {cur['desc']}\n"
-                               f"Passes Attempted: **{cur['line']}**")
-                    elif cur["line"] != old["line"]:
-                        arrow = "⬆️ Bumped up" if cur["line"] > old["line"] else "⬇️ Dropped"
-                        notify(f"{arrow}\n{cur['name']} vs {cur['desc']}\n"
-                               f"Passes Attempted: {old['line']} → **{cur['line']}**")
-            seen = current
-        except requests.HTTPError as e:
-            code = e.response.status_code
-            print("HTTP error", code)
-            if code in (403, 429):
-                backoff = min(backoff * 2, 900)
-                if code == 403:
-                    print("Blocked by PrizePicks - see README about PROXY_URL")
+            cur = parse(fetch())
+
+            for _id, info in cur.items():
+                if _id not in seen:
+                    send(f"🆕 NEW: {info['name']} - {info['desc']} {info['line']}")
+                elif cur[_id]["line"] != seen[_id]["line"]:
+                    send(f"📈 MOVE: {info['name']} {seen[_id]['line']} -> {info['line']}")
+
+            seen = cur
+            time.sleep(POLL_SECONDS)
+
         except Exception as e:
-            print("error:", e)
-        time.sleep(backoff)
+            print(f"Error: {e}")
+            time.sleep(backoff)
+
 if __name__ == "__main__":
     main()
