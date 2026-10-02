@@ -2,6 +2,176 @@ import requests, time, os
 from datetime import datetime
 from collections import defaultdict
 
+
+# ===== MATCHUP / H2H STATS (API-Football) =====
+
+KEY = os.getenv("API_FOOTBALL_KEY")
+SEASON = os.getenv("SEASON", "2026")
+EDGE_PCT = float(os.getenv("EDGE_PCT", "0.10"))  # gap needed, as % of the line
+MIN_EDGE = float(os.getenv("MIN_EDGE", "2"))     # but never less than this many passes
+CAP = int(os.getenv("DAILY_CAP", "90"))       # max API calls per UTC day
+H2H_GAMES = int(os.getenv("H2H_GAMES", "3"))
+BASE = "https://v3.football.api-sports.io"
+
+_cache = {}
+_calls = {"day": None, "n": 0}
+
+
+def _get(path, params):
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if _calls["day"] != today:
+        _calls["day"], _calls["n"] = today, 0
+    if _calls["n"] >= CAP:
+        raise RuntimeError("daily call cap reached")
+    _calls["n"] += 1
+    r = requests.get(BASE + path, headers={"x-apisports-key": KEY},
+                     params=params, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("errors"):
+        raise RuntimeError(str(j["errors"]))
+    return j.get("response", [])
+
+
+def _cached(key, fn):
+    hit = _cache.get(key)
+    if hit and time.time() < hit[0]:
+        return hit[1]
+    try:
+        val, ttl = fn(), 12 * 3600
+    except Exception as e:
+        print("stats error:", key[0], e)
+        val, ttl = None, 3600
+    _cache[key] = (time.time() + ttl, val)
+    return val
+
+
+def status():
+    """Startup check: shows plan and usage."""
+    if not KEY:
+        return "API-Football: no key set (matchup alerts OFF)"
+    try:
+        r = requests.get(BASE + "/status", headers={"x-apisports-key": KEY}, timeout=15)
+        d = r.json().get("response", {})
+        plan = d.get("subscription", {}).get("plan", "?")
+        req = d.get("requests", {})
+        return f"API-Football plan: {plan}, used {req.get('current')}/{req.get('limit_day')} today"
+    except Exception as e:
+        return f"API-Football status check failed: {e}"
+
+
+def _team_id(name):
+    for q in (name, max(name.split(), key=len)):
+        res = _get("/teams", {"search": q})
+        if res:
+            for t in res:
+                if t["team"]["name"].lower() == name.lower():
+                    return t["team"]["id"]
+            return res[0]["team"]["id"]
+    return None
+
+
+def _player(name):
+    parts = name.split()
+    first, last = parts[0].lower(), parts[-1].lower()
+    pid = None
+    for p in _get("/players/profiles", {"search": last}):
+        pl = p["player"]
+        if (pl.get("lastname") or "").lower() == last and \
+           (pl.get("firstname") or "").lower().startswith(first[0]):
+            pid = pl["id"]
+            break
+    if not pid:
+        return None
+    data = _get("/players", {"id": pid, "season": SEASON})
+    passes = mins = 0
+    for s in (data[0]["statistics"] if data else []):
+        passes += s["passes"]["total"] or 0
+        mins += s["games"]["minutes"] or 0
+    if mins < 180:
+        return None
+    return pid, passes / (mins / 90)
+
+
+def _passes(stat_block):
+    for s in stat_block["statistics"]:
+        if s["type"] == "Total passes":
+            return s["value"] or 0
+    return None
+
+
+def _form(tid):
+    """Avg passes a team makes, and passes opponents make against it (last 5)."""
+    made, allowed = [], []
+    for f in _get("/fixtures", {"team": tid, "last": 5}):
+        if f["fixture"]["status"]["short"] not in ("FT", "AET", "PEN"):
+            continue
+        blocks = _get("/fixtures/statistics", {"fixture": f["fixture"]["id"]})
+        mine = [_passes(b) for b in blocks if b["team"]["id"] == tid]
+        theirs = [_passes(b) for b in blocks if b["team"]["id"] != tid]
+        if mine and theirs and mine[0] is not None and theirs[0] is not None:
+            made.append(mine[0])
+            allowed.append(theirs[0])
+    if len(made) < 3:
+        return None
+    return sum(made) / len(made), sum(allowed) / len(allowed)
+
+
+def _h2h(pid, tid, oid):
+    out = []
+    fx = _get("/fixtures/headtohead", {"h2h": f"{tid}-{oid}", "last": H2H_GAMES})
+    for f in fx:
+        if f["fixture"]["status"]["short"] not in ("FT", "AET", "PEN"):
+            continue
+        for team_block in _get("/fixtures/players", {"fixture": f["fixture"]["id"]}):
+            for pl in team_block["players"]:
+                if pl["player"]["id"] == pid:
+                    st = pl["statistics"][0]
+                    mins = st["games"]["minutes"] or 0
+                    tot = st["passes"]["total"]
+                    if mins >= 30 and tot is not None:
+                        out.append(round(tot / mins * 90, 1))
+    return out
+
+
+def lean(name, team, opp, line):
+    """Returns alert text ONLY when the matchup shows a real edge, else ''."""
+    if not KEY or not team or not opp:
+        return ""
+    p = _cached(("player", name), lambda: _player(name))
+    tid = _cached(("team", team), lambda: _team_id(team))
+    oid = _cached(("team", opp), lambda: _team_id(opp))
+    if not (p and tid and oid):
+        return ""
+    pid, per90 = p
+    tf = _cached(("form", tid), lambda: _form(tid))
+    of = _cached(("form", oid), lambda: _form(oid))
+    if not (tf and of):
+        return ""
+
+    team_made, _ = tf
+    _, opp_allowed = of
+    expected_team = (team_made + opp_allowed) / 2
+    factor = expected_team / team_made if team_made else 1
+    proj = per90 * factor
+
+    hh = _cached(("h2h", pid, oid), lambda: _h2h(pid, tid, oid)) or []
+    h2h_line = ""
+    if len(hh) >= 2:
+        proj = 0.5 * proj + 0.5 * (sum(hh) / len(hh))
+        h2h_line = f"\n   • H2H: {', '.join(str(x) for x in hh)} ({len(hh)} games)"
+
+    gap = proj - line
+    if abs(gap) < max(EDGE_PCT * line, MIN_EDGE):
+        return ""
+    tag = "🔥 lean OVER" if gap > 0 else "🧊 lean UNDER"
+    return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
+            f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
+            f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
+            f"{h2h_line}")
+
+
+# ===== PRIZEPICKS MONITOR =====
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -14,130 +184,152 @@ session.headers.update(HEADERS)
 
 URL = "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem"
 
+
 def fetch():
     r = session.get(URL, timeout=20)
+    r.raise_for_status()
     return r.json()
+
 
 def parse(data):
     players, leagues, games = {}, {}, {}
     for inc in data.get("included", []):
+        a = inc.get("attributes", {})
         if inc.get("type") == "new_player":
-            players[inc["id"]] = inc["attributes"].get("name","Unknown")
+            players[inc["id"]] = (a.get("name", "Unknown"),
+                                  a.get("team") or a.get("team_name") or "")
         if inc.get("type") == "league":
-            leagues[inc["id"]] = inc["attributes"].get("name","")
+            leagues[inc["id"]] = a.get("name", "")
         if inc.get("type") == "game":
-            attrs = inc["attributes"]
-            # Try every possible name field
-            name = attrs.get("name") or attrs.get("description") or attrs.get("label") or "Soccer Match"
+            name = a.get("name") or a.get("description") or a.get("label") or "Soccer Match"
             games[inc["id"]] = {
                 "name": name,
-                "start": attrs.get("start_time") or attrs.get("game_time") or attrs.get("starts_at") or ""
+                "start": a.get("start_time") or a.get("game_time") or a.get("starts_at") or ""
             }
 
     cur = {}
     for item in data.get("data", []):
         try:
             attrs = item["attributes"]
-            stat = str(attrs.get("stat_display_name","")).lower()
+            stat = str(attrs.get("stat_display_name", "")).lower()
             if "pass" not in stat or "attempt" not in stat:
                 continue
 
-            league_id = item.get("relationships",{}).get("league",{}).get("data",{}).get("id")
+            rel = item.get("relationships", {})
+            league_id = rel.get("league", {}).get("data", {}).get("id")
             league_name = leagues.get(league_id, "").upper()
             if "NFL" in league_name or "CFB" in league_name or "NCAAF" in league_name or "FOOTBALL" in league_name:
                 continue
 
-            game_id = item.get("relationships",{}).get("game",{}).get("data",{}).get("id")
+            game_id = rel.get("game", {}).get("data", {}).get("id")
             game_info = games.get(game_id, {"name": league_name.title() or "Soccer Match", "start": ""})
 
-            _id = item["id"]
-            pid = item.get("relationships",{}).get("new_player",{}).get("data",{}).get("id")
+            pid = rel.get("new_player", {}).get("data", {}).get("id")
+            pname, pteam = players.get(pid, (attrs.get("description", "Unknown"), ""))
 
-            cur[_id] = {
-                "name": players.get(pid, attrs.get("description","Unknown")),
-                "line": attrs.get("line_score",0),
+            opp = attrs.get("description", "")
+            if pteam and opp:
+                game_label = " vs ".join(sorted([pteam, opp]))
+            else:
+                game_label = game_info["name"]
+
+            cur[item["id"]] = {
+                "name": pname,
+                "team": pteam,
+                "opp": opp,   # PrizePicks puts the opponent here
+                "line": attrs.get("line_score", 0),
                 "league": league_name,
                 "game_id": game_id,
-                "game_name": game_info["name"],
-                "game_start": game_info["start"]
+                "game_name": game_label,
+                "game_start": game_info["start"],
             }
-        except:
+        except Exception:
             continue
     return cur
+
 
 def format_start_time(iso_str):
     if not iso_str:
         return "TBD"
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z","+00:00"))
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         return dt.strftime("%A, %B %d, %Y at %I:%M %p")
-    except:
+    except Exception:
         return iso_str
 
-def send_grouped_embeds(new_props):
-    if not WEBHOOK_URL or not new_props:
+
+def send_grouped_embeds(props_to_send):
+    if not WEBHOOK_URL or not props_to_send:
         return
 
     grouped = defaultdict(list)
-    for info in new_props:
+    for info in props_to_send:
         grouped[info["game_name"]].append(info)
 
     for game_name, props in grouped.items():
-        start_str = format_start_time(props[0].get("game_start",""))
-        lines_text = "\n".join([f"{p['name']} — Passes `{p['line']}`" for p in props])
+        start_str = format_start_time(props[0].get("game_start", ""))
+        lines_text = "\n".join(
+            [f"{p['label']} — Passes `{p['line']}`{p['note']}" for p in props])
 
         embed = {
-            "title": "🚨 PrizePicks — SOCCER PASSES ARE UP",
+            "title": "🚨 Captain Hook — JUICY SOCCER PASSES SPOT",
             "description": f"**{game_name}**\n{lines_text}",
-            "color": 3066993, # green
-            "fields": [
-                {
-                    "name": "Starts",
-                    "value": start_str,
-                    "inline": False
-                }
-            ],
-            "footer": {
-                "text": f"PrizePicks • {len(props)} prop(s)"
-            },
-            "timestamp": datetime.utcnow().isoformat()
+            "color": 3066993,
+            "fields": [{"name": "Starts", "value": start_str, "inline": False}],
+            "footer": {"text": f"PrizePicks • {len(props)} prop(s)"},
+            "timestamp": datetime.utcnow().isoformat(),
         }
+        requests.post(WEBHOOK_URL,
+                      json={"username": "Captain Hook", "embeds": [embed]},
+                      timeout=10)
 
-        payload = {
-            "username": "PrizePicks",
-            "embeds": [embed]
-        }
-        requests.post(WEBHOOK_URL, json=payload, timeout=10)
 
 def main():
-    print("Captain Hook - SOCCER Passes Attempted ONLY - EMBED MODE V2")
-    seen = parse(fetch())
-    print(f"Initial tracking {len(seen)} SOCCER passes lines - NFL BLOCKED")
+    print("Captain Hook - SOCCER Passes Attempted - MATCHUP MODE")
+
+    seen = None
+    while seen is None:
+        try:
+            seen = parse(fetch())
+        except Exception as e:
+            print(f"Initial fetch failed: {e}")
+            time.sleep(60)
+    print(f"Initial tracking {len(seen)} SOCCER passes lines")
     if WEBHOOK_URL:
-        requests.post(WEBHOOK_URL, json={"content": f"✅ Hook V2 live: Tracking {len(seen)} SOCCER Passes ONLY. Box format fixed."}, timeout=10)
+        requests.post(WEBHOOK_URL, json={
+            "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
+                       f"Only juicy matchups will alert.\n{status()}"}, timeout=10)
 
     while True:
         time.sleep(60)
         try:
             cur = parse(fetch())
-            new_to_send = []
+            to_send = []
             for _id, info in cur.items():
-                if _id not in seen:
-                    new_to_send.append(info)
-                elif info["line"]!= seen[_id]["line"]:
-                    # line bump
-                    copy = info.copy()
-                    copy["name"] = f"📈 {info['name']} {seen[_id]['line']} -> {info['line']}"
-                    new_to_send.append(copy)
+                is_new = _id not in seen
+                moved = (not is_new) and info["line"] != seen[_id]["line"]
+                if not (is_new or moved):
+                    continue
 
-            if new_to_send:
-                send_grouped_embeds(new_to_send)
+                note = lean(info["name"], info["team"], info["opp"], float(info["line"]))
+                if not note:
+                    continue  # not juicy, stay quiet
+
+                item = info.copy()
+                item["note"] = note
+                item["label"] = (f"📈 {info['name']} {seen[_id]['line']} -> {info['line']}"
+                                 if moved else info["name"])
+                to_send.append(item)
+
+            if to_send:
+                send_grouped_embeds(to_send)
 
             seen = cur
-            print(f"Checked {len(cur)} soccer lines")
+            print(f"Checked {len(cur)} soccer lines, sent {len(to_send)}")
         except Exception as e:
             print(f"Error {e}")
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
