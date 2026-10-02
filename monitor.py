@@ -300,9 +300,13 @@ def main():
             time.sleep(60)
     print(f"Initial tracking {len(seen)} SOCCER passes lines")
     if WEBHOOK_URL:
-        requests.post(WEBHOOK_URL, json={
+        r = requests.post(WEBHOOK_URL, json={
             "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
                        f"All new lines and bumps post; juicy matchups are flagged 🔥.\n{status()}"}, timeout=10)
+        print(f"Startup message -> Discord status {r.status_code}")
+        print(status())
+    else:
+        print("WEBHOOK_URL is not set")
 
     while True:
         time.sleep(60)
