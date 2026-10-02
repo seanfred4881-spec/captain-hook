@@ -186,6 +186,8 @@ session.headers.update(HEADERS)
 
 URL = "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem"
 
+SENT_TTL = 3600  # seconds to remember an already-sent alert
+
 
 def fetch():
     r = session.get(URL, timeout=20)
@@ -283,9 +285,13 @@ def send_grouped_embeds(props_to_send):
             "footer": {"text": f"PrizePicks • {len(props)} prop(s)"},
             "timestamp": datetime.utcnow().isoformat(),
         }
-        requests.post(WEBHOOK_URL,
-                      json={"username": "Captain Hook", "embeds": [embed]},
-                      timeout=10)
+        # Each group is sent on its own so one failure can't abort the rest
+        try:
+            requests.post(WEBHOOK_URL,
+                          json={"username": "Captain Hook", "embeds": [embed]},
+                          timeout=10)
+        except Exception as e:
+            print(f"Send failed for {game_name}: {e}")
 
 
 def main():
@@ -308,10 +314,18 @@ def main():
     else:
         print("WEBHOOK_URL is not set")
 
+    sent = {}  # (prop_id, old_line, new_line) -> time sent
+
     while True:
         time.sleep(60)
         try:
             cur = parse(fetch())
+
+            # forget old sent keys
+            now = time.time()
+            for k in [k for k, t in sent.items() if now - t > SENT_TTL]:
+                del sent[k]
+
             to_send = []
             for _id, info in cur.items():
                 is_new = _id not in seen
@@ -319,19 +333,30 @@ def main():
                 if not (is_new or moved):
                     continue
 
+                old = seen[_id]["line"] if moved else None
+                key = (_id, old, info["line"])
+                if key in sent:
+                    continue
+                sent[key] = now
+
                 note, juicy = lean(info["name"], info["team"], info["opp"], float(info["line"]))
 
                 item = info.copy()
                 item["note"] = note
                 item["juicy"] = juicy
-                item["label"] = (f"📈 {info['name']} {seen[_id]['line']} -> {info['line']}"
+                item["label"] = (f"📈 {info['name']} {old} -> {info['line']}"
                                  if moved else info["name"])
                 to_send.append(item)
 
-            if to_send:
-                send_grouped_embeds(to_send)
-
+            # Update state BEFORE sending so a send error can't cause a re-alert
             seen = cur
+
+            if to_send:
+                try:
+                    send_grouped_embeds(to_send)
+                except Exception as e:
+                    print(f"Send failed: {e}")
+
             print(f"Checked {len(cur)} soccer lines, sent {len(to_send)}")
         except Exception as e:
             print(f"Error {e}")
