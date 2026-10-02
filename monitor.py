@@ -135,19 +135,19 @@ def _h2h(pid, tid, oid):
 
 
 def lean(name, team, opp, line):
-    """Returns alert text ONLY when the matchup shows a real edge, else ''."""
+    """Returns (note, juicy). note is '' if stats are unavailable."""
     if not KEY or not team or not opp:
-        return ""
+        return "", False
     p = _cached(("player", name), lambda: _player(name))
     tid = _cached(("team", team), lambda: _team_id(team))
     oid = _cached(("team", opp), lambda: _team_id(opp))
     if not (p and tid and oid):
-        return ""
+        return "", False
     pid, per90 = p
     tf = _cached(("form", tid), lambda: _form(tid))
     of = _cached(("form", oid), lambda: _form(oid))
     if not (tf and of):
-        return ""
+        return "", False
 
     team_made, _ = tf
     _, opp_allowed = of
@@ -162,13 +162,15 @@ def lean(name, team, opp, line):
         h2h_line = f"\n   • H2H: {', '.join(str(x) for x in hh)} ({len(hh)} games)"
 
     gap = proj - line
-    if abs(gap) < max(EDGE_PCT * line, MIN_EDGE):
-        return ""
-    tag = "🔥 lean OVER" if gap > 0 else "🧊 lean UNDER"
+    juicy = abs(gap) >= max(EDGE_PCT * line, MIN_EDGE)
+    if juicy:
+        tag = "🔥 JUICY — lean OVER" if gap > 0 else "🧊 JUICY — lean UNDER"
+    else:
+        tag = "⚪ no clear edge"
     return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
             f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
             f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
-            f"{h2h_line}")
+            f"{h2h_line}", juicy)
 
 
 # ===== PRIZEPICKS MONITOR =====
@@ -271,10 +273,12 @@ def send_grouped_embeds(props_to_send):
         lines_text = "\n".join(
             [f"{p['label']} — Passes `{p['line']}`{p['note']}" for p in props])
 
+        any_juicy = any(p.get("juicy") for p in props)
         embed = {
-            "title": "🚨 Captain Hook — JUICY SOCCER PASSES SPOT",
+            "title": ("🔥 Captain Hook — JUICY SOCCER PASSES SPOT" if any_juicy
+                      else "🚨 Captain Hook — SOCCER PASSES"),
             "description": f"**{game_name}**\n{lines_text}",
-            "color": 3066993,
+            "color": 3066993 if any_juicy else 3447003,
             "fields": [{"name": "Starts", "value": start_str, "inline": False}],
             "footer": {"text": f"PrizePicks • {len(props)} prop(s)"},
             "timestamp": datetime.utcnow().isoformat(),
@@ -298,7 +302,7 @@ def main():
     if WEBHOOK_URL:
         requests.post(WEBHOOK_URL, json={
             "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
-                       f"Only juicy matchups will alert.\n{status()}"}, timeout=10)
+                       f"All new lines and bumps post; juicy matchups are flagged 🔥.\n{status()}"}, timeout=10)
 
     while True:
         time.sleep(60)
@@ -311,12 +315,11 @@ def main():
                 if not (is_new or moved):
                     continue
 
-                note = lean(info["name"], info["team"], info["opp"], float(info["line"]))
-                if not note:
-                    continue  # not juicy, stay quiet
+                note, juicy = lean(info["name"], info["team"], info["opp"], float(info["line"]))
 
                 item = info.copy()
                 item["note"] = note
+                item["juicy"] = juicy
                 item["label"] = (f"📈 {info['name']} {seen[_id]['line']} -> {info['line']}"
                                  if moved else info["name"])
                 to_send.append(item)
