@@ -118,13 +118,15 @@ def _player(name):
         return None
     first, last = parts[0].lower(), parts[-1].lower()
     pid = None
-    for p in _get("/players/profiles", {"search": last}):
+    cands = _get("/players/profiles", {"search": last})
+    for p in cands:
         pl = p["player"]
         if _clean(pl.get("lastname") or "").lower() == last and \
            _clean(pl.get("firstname") or "").lower().startswith(first[0]):
             pid = pl["id"]
             break
     if not pid:
+        print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname")) for c in cands][:6])
         return None
     data = _get("/players", {"id": pid, "season": SEASON})
     passes = mins = apps = sub_out = 0
