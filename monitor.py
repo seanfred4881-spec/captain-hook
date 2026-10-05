@@ -1,4 +1,4 @@
-import requests, time, os
+import requests, time, os, unicodedata, re
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -90,26 +90,38 @@ ALIASES = {"turkiye": "Turkey", "türkiye": "Turkey", "bosnia and herzegovina": 
            "rep. of ireland": "Ireland", "republic of ireland": "Ireland"}   # PrizePicks vs API-Football spellings (extend as needed)
 
 
+def _clean(s):
+    """API-Football search only accepts plain letters and spaces. Strip accents, periods, hyphens, &, etc."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z ]", " ", s)).strip()
+
+
 def _team_id(name):
     alias = ALIASES.get(name.lower())
     for q in ([alias] if alias else []) + [name, max(name.split(), key=len)]:
+        q = _clean(q)
+        if len(q) < 3:
+            continue
         res = _get("/teams", {"search": q})
         if res:
             for t in res:
-                if t["team"]["name"].lower() == name.lower():
+                if _clean(t["team"]["name"]).lower() == q.lower():
                     return t["team"]["id"]
             return res[0]["team"]["id"]
     return None
 
 
 def _player(name):
-    parts = name.split()
+    parts = _clean(name).split()
+    if len(parts) < 2 or len(parts[-1]) < 3:
+        return None
     first, last = parts[0].lower(), parts[-1].lower()
     pid = None
     for p in _get("/players/profiles", {"search": last}):
         pl = p["player"]
-        if (pl.get("lastname") or "").lower() == last and \
-           (pl.get("firstname") or "").lower().startswith(first[0]):
+        if _clean(pl.get("lastname") or "").lower() == last and \
+           _clean(pl.get("firstname") or "").lower().startswith(first[0]):
             pid = pl["id"]
             break
     if not pid:
