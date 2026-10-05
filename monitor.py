@@ -21,15 +21,26 @@ _last_err = {}
 _calls = {"day": None, "n": 0}
 
 
+CALL_SPACING = float(os.getenv("CALL_SPACING", "6.5"))   # seconds between calls; free plan = 10/min. On Pro use 0.3
+_last = {"t": 0.0}
+
+
 def _get(path, params):
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if _calls["day"] != today:
         _calls["day"], _calls["n"] = today, 0
     if _calls["n"] >= CAP:
         raise RuntimeError("daily call cap reached")
+    wait = CALL_SPACING - (time.time() - _last["t"])
+    if wait > 0:
+        time.sleep(wait)
+    _last["t"] = time.time()
     _calls["n"] += 1
     r = requests.get(BASE + path, headers={"x-apisports-key": KEY},
                      params=params, timeout=15)
+    if r.status_code == 429:
+        _calls["n"] -= 1
+        raise RuntimeError("429 rate limit: too many calls per minute")
     r.raise_for_status()
     j = r.json()
     if j.get("errors"):
@@ -47,7 +58,7 @@ def _cached(key, fn):
     except Exception as e:
         print("stats error:", key[0], e)
         _last_err[key] = str(e)
-        val, ttl = None, 3600
+        val, ttl = None, (600 if ("429" in str(e) or "cap" in str(e)) else 3600)
     _cache[key] = (time.time() + ttl, val)
     return val
 
@@ -164,7 +175,11 @@ def _why(*keys):
     for k in keys:
         e = _last_err.get(k)
         if e:
-            return "daily call cap reached" if "cap" in e else e[:50]
+            if "cap" in e:
+                return "daily call cap reached"
+            if "429" in e:
+                return "rate limit (too many calls per minute)"
+            return e[:50]
     return "not found"
 
 
@@ -344,6 +359,8 @@ def send_grouped_embeds(props_to_send):
 SWEEP_MINUTES = int(os.getenv("SWEEP_MINUTES", "120"))          # how often to re-check the WHOLE board
 SWEEP_HOURS_AHEAD = float(os.getenv("SWEEP_HOURS_AHEAD", "30"))   # only games starting within this window
 SWEEP_SUMMARY = os.getenv("SWEEP_SUMMARY", "true").lower() == "true"
+SWEEP_CALL_BUDGET = int(os.getenv("SWEEP_CALL_BUDGET", "25"))     # max API calls one sweep may start
+SWEEP_KEEP = int(os.getenv("SWEEP_KEEP", "30"))                   # daily calls always kept for new/moved alerts
 _judged = {"day": None, "keys": set()}
 
 
@@ -367,11 +384,16 @@ def sweep(cur, already):
         rows.append((st or now + timedelta(days=9), _id, info))
     rows.sort(key=lambda r: r[0])
 
-    checked = with_data = 0
+    checked = with_data = skipped = 0
     juicy_items, reasons = [], defaultdict(int)
+    start_calls, stopped = calls_used(), False
     for _, _id, info in rows:
         k = (_id, info["line"])
         if k in _judged["keys"] or k in already:
+            continue
+        if calls_used() - start_calls >= SWEEP_CALL_BUDGET or CAP - calls_used() < SWEEP_KEEP:
+            stopped = True
+            skipped += 1
             continue
         note, juicy, reason = lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
         checked += 1
@@ -394,6 +416,8 @@ def sweep(cur, already):
         if reasons:
             top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
             msg += "\nNo matchup data for " + str(sum(reasons.values())) + ": " + ", ".join(f"{n}× {r}" for r, n in top)
+        if stopped:
+            msg += f"\n⏸️ Stopped early to protect today's calls: {skipped} lines left for the next sweep"
         msg += f"\nAPI-Football calls today: {calls_used()}/{CAP}"
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
 
