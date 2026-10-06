@@ -18,6 +18,7 @@ MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = lin
 LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
 RECENT_CHECK = os.getenv("RECENT_CHECK", "true").lower() == "true"  # hold back a 🔥/🧊 if recent games disagree with it
 RECENT_AGREE = float(os.getenv("RECENT_AGREE", "0.5"))              # share of recent games that must be on the lean side
+FORM_GAMES = int(os.getenv("FORM_GAMES", "5"))                     # how many recent team games to look at (red-card games get left out)
 MAX_GAP_RATIO = float(os.getenv("MAX_GAP_RATIO", "0.5"))            # projection more than this far from the line = data problem, no tag
 LEAGUE_CHECK_ON_START = os.getenv("LEAGUE_CHECK_ON_START", "true").lower() == "true"
 LEAGUE_CHECK = os.getenv(
@@ -205,22 +206,39 @@ def _passes(stat_block):
     return None
 
 
+def _red(stat_block):
+    for st in stat_block["statistics"]:
+        if st["type"] == "Red Cards":
+            try:
+                return int(st["value"] or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def _form(tid):
-    """Avg passes a team makes, passes opponents make against it (last 5), and the fixture ids used."""
-    made, allowed, fids = [], [], []
-    for f in _get("/fixtures", {"team": tid, "last": 5}):
+    """Avg passes a team makes, passes opponents make against it, and the fixtures used.
+    Games with a red card (either team) are left out when enough clean games remain, because
+    a red card wrecks the pass counts. Costs no extra calls: red cards come with the same stats."""
+    rows = []
+    for f in _get("/fixtures", {"team": tid, "last": FORM_GAMES}):
         if f["fixture"]["status"]["short"] not in ("FT", "AET", "PEN"):
             continue
         blocks = _get("/fixtures/statistics", {"fixture": f["fixture"]["id"]})
         mine = [_passes(b) for b in blocks if b["team"]["id"] == tid]
         theirs = [_passes(b) for b in blocks if b["team"]["id"] != tid]
         if mine and theirs and mine[0] is not None and theirs[0] is not None:
-            made.append(mine[0])
-            allowed.append(theirs[0])
-            fids.append(f["fixture"]["id"])
-    if len(made) < 3:
+            red = any(_red(b) > 0 for b in blocks)
+            rows.append((f["fixture"]["id"], mine[0], theirs[0], red))
+    clean = [r for r in rows if not r[3]]
+    use = clean if len(clean) >= 3 else rows        # not enough clean games: fall back to all of them
+    if len(use) < 3:
         return None
-    return sum(made) / len(made), sum(allowed) / len(allowed), fids
+    return {"made": sum(r[1] for r in use) / len(use),
+            "allowed": sum(r[2] for r in use) / len(use),
+            "fids": [r[0] for r in use],
+            "red_out": len(rows) - len(use),        # red-card games left out
+            "red_in": any(r[3] for r in use)}       # red-card games still counted (too few clean games)
 
 
 def _last5(pid, fids):
@@ -338,8 +356,13 @@ def lean_ex(name, team, opp, line):
     if not (tf and of):
         return "", False, "recent games: " + _why(fk1, fk2)
 
-    team_made, _, fids = tf
-    _, opp_allowed, _ = of
+    team_made, fids = tf["made"], tf["fids"]
+    opp_allowed = of["allowed"]
+    red_line = ""
+    if tf["red_out"] or of["red_out"]:
+        red_line = "\n   • Red-card games left out of the form numbers"
+    elif tf["red_in"] or of["red_in"]:
+        red_line = "\n   ⚠️ Form numbers include red-card games (too few clean ones)"
     expected_team = (team_made + opp_allowed) / 2
     factor = expected_team / team_made if team_made else 1
     proj = per90 * factor
@@ -375,7 +398,8 @@ def lean_ex(name, team, opp, line):
         if len(l5) >= 3:
             over = sum(1 for x in l5 if x > line)
             last5_line = (f"\n   • Last {len(l5)} games: {', '.join(str(x) for x in l5)}"
-                          f" → over {line} in {over}/{len(l5)}")
+                          f" → over {line} in {over}/{len(l5)}"
+                          + (" (red-card games left out)" if tf["red_out"] else ""))
 
     if juicy and RECENT_CHECK:
         lean_over = gap > 0
@@ -401,7 +425,7 @@ def lean_ex(name, team, opp, line):
     return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
             f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
             f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
-            f"{gk_line}{h2h_line}{last5_line}{sub_line}", direction, "")
+            f"{red_line}{gk_line}{h2h_line}{last5_line}{sub_line}", direction, "")
 
 
 def lean(name, team, opp, line):
