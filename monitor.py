@@ -219,7 +219,7 @@ def _last5(pid, fids):
 
 
 def _h2h(pid, tid, oid):
-    out = []
+    out, last = [], None
     fx = _get("/fixtures/headtohead", {"h2h": f"{tid}-{oid}", "last": H2H_GAMES})
     for f in fx:
         if f["fixture"]["status"]["short"] not in ("FT", "AET", "PEN"):
@@ -232,7 +232,10 @@ def _h2h(pid, tid, oid):
                     tot = st["passes"]["total"]
                     if mins >= 30 and tot is not None:
                         out.append(round(tot / mins * 90, 1))
-    return out
+                        d = str(f["fixture"].get("date") or "")[:10]
+                        if last is None or d >= last[0]:
+                            last = (d, tot, mins)
+    return {"per90": out, "last": last}
 
 
 def calls_used():
@@ -299,10 +302,10 @@ def lean_ex(name, team, opp, line):
         return "", False, "PrizePicks gave no team/opponent"
     pk, tk, ok = ("player", name), ("team", team), ("team", opp)
     p = _cached(pk, lambda: _player(name))
+    if not p:                                      # no player data -> don't spend calls on team lookups
+        return "", False, "player: " + _why(pk)
     tid = _cached(tk, lambda: _team_id(team))
     oid = _cached(ok, lambda: _team_id(opp))
-    if not p:
-        return "", False, "player: " + _why(pk)
     if not (tid and oid):
         return "", False, "team: " + _why(tk, ok)
     pid, per90, risk = p
@@ -318,11 +321,15 @@ def lean_ex(name, team, opp, line):
     factor = expected_team / team_made if team_made else 1
     proj = per90 * factor
 
-    hh = _cached(("h2h", pid, oid), lambda: _h2h(pid, tid, oid)) or []
+    hd = _cached(("h2h", pid, oid), lambda: _h2h(pid, tid, oid)) or {"per90": [], "last": None}
+    hh = hd["per90"]
     h2h_line = ""
     if len(hh) >= 2:
         proj = 0.5 * proj + 0.5 * (sum(hh) / len(hh))
         h2h_line = f"\n   • H2H: {', '.join(str(x) for x in hh)} ({len(hh)} games)"
+    if hd["last"]:                                   # one previous meeting is shown, but only 2+ change the projection
+        d, tot, mins = hd["last"]
+        h2h_line += f"\n   • Last meeting: {tot} passes in {mins} min ({d})"
 
     gap = proj - line
     juicy = abs(gap) >= max(EDGE_PCT * line, MIN_EDGE)
@@ -449,6 +456,22 @@ def format_start_time(iso_str):
         return iso_str
 
 
+def _post(payload):
+    """Post to Discord. If Discord says 'slow down' (429), wait the time it asks for and try again."""
+    r = None
+    for _ in range(4):
+        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        if r.status_code != 429:
+            return r
+        try:
+            wait = float(r.json().get("retry_after", 2))
+        except Exception:
+            wait = 2.0
+        print(f"Discord rate limit, retrying in {wait:.1f}s")
+        time.sleep(min(wait, 15) + 0.5)
+    return r
+
+
 def _dir_prefix(direction):
     if direction == "OVER":
         return "🔥 **JUICY — LEAN OVER** — "
@@ -484,9 +507,7 @@ def send_grouped_embeds(props_to_send):
             "footer": {"text": f"PrizePicks • {len(props)} prop(s) • {INSTANCE}"},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        requests.post(WEBHOOK_URL,
-                      json={"username": "Captain Hook", "embeds": [embed]},
-                      timeout=10)
+        _post({"username": "Captain Hook", "embeds": [embed]})
 
 
 SWEEP_MINUTES = int(os.getenv("SWEEP_MINUTES", "120"))          # how often to re-check the WHOLE board
@@ -556,7 +577,7 @@ def sweep(cur, already):
         if stopped:
             msg += f"\n⏸️ Stopped early to protect today's calls: {skipped} lines left for the next sweep"
         msg += f"\nAPI-Football calls today: {calls_used()}/{CAP}"
-        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
+        _post({"content": msg})
 
 
 def main():
@@ -572,16 +593,16 @@ def main():
     print(f"Initial tracking {len(seen)} SOCCER passes lines")
     if WEBHOOK_URL:
         extra = f"\n{status()}" if MATCHUP else "\nMatchup lookups are OFF (line alerts only)."
-        r = requests.post(WEBHOOK_URL, json={
+        r = _post({
             "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
-                       f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER.{extra}"}, timeout=10)
+                       f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER.{extra}"})
         print(f"Startup message -> Discord status {r.status_code}")
         print(status())
         if LEAGUE_CHECK_ON_START and MATCHUP:
             try:
                 rep = league_report()
                 if rep:
-                    requests.post(WEBHOOK_URL, json={"content": rep[:1900]}, timeout=10)
+                    _post({"content": rep[:1900]})
             except Exception as e:
                 print(f"League report failed: {e}")
     else:
