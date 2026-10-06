@@ -16,6 +16,8 @@ SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearan
 SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minutes per appearance is below this
 MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = line alerts only, no API-Football calls
 LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
+RECENT_CHECK = os.getenv("RECENT_CHECK", "true").lower() == "true"  # hold back a 🔥/🧊 if recent games disagree with it
+RECENT_AGREE = float(os.getenv("RECENT_AGREE", "0.5"))              # share of recent games that must be on the lean side
 LEAGUE_CHECK_ON_START = os.getenv("LEAGUE_CHECK_ON_START", "true").lower() == "true"
 LEAGUE_CHECK = os.getenv(
     "LEAGUE_CHECK",
@@ -27,6 +29,7 @@ BASE = "https://v3.football.api-sports.io"
 _cache = {}
 _last_err = {}
 _calls = {"day": None, "n": 0}
+_suppressed = {"n": 0}        # picks held back this sweep because recent games disagreed
 _locked = {"until": 0.0}      # set when the free plan blocks the season, so we stop wasting calls
 
 
@@ -342,12 +345,26 @@ def lean_ex(name, team, opp, line):
     gk_line = "\n   🧤 Goalkeeper: passes depend on his team's style and the flow of the game." if is_gk else ""
 
     last5_line = ""
+    l5 = []
     if juicy or is_gk or LAST5_ALL:
         l5 = _cached(("last5", pid, tid), lambda: _last5(pid, fids)) or []
         if len(l5) >= 3:
             over = sum(1 for x in l5 if x > line)
             last5_line = (f"\n   • Last {len(l5)} games: {', '.join(str(x) for x in l5)}"
                           f" → over {line} in {over}/{len(l5)}")
+
+    if juicy and RECENT_CHECK:
+        lean_over = gap > 0
+        disagree = False
+        if len(l5) >= 3:                                   # most recent games must be on the lean side of the line
+            hits = sum(1 for x in l5 if (x > line) == lean_over)
+            disagree = hits / len(l5) < RECENT_AGREE
+        lm = hd["last"]
+        if lm and lm[2] >= 60 and (lm[1] > line) != lean_over:   # last full meeting went the other way
+            disagree = True
+        if disagree:
+            _suppressed["n"] += 1
+            return "", False, ""                           # post it as a plain passes line, no tag
 
     sub_line = ""
     if juicy and not is_gk and risk["apps"] >= SUB_MIN_APPS:
@@ -541,6 +558,7 @@ def sweep(cur, already):
     rows.sort(key=lambda r: r[0])
 
     checked = with_data = skipped = 0
+    _suppressed["n"] = 0
     juicy_items, reasons = [], defaultdict(int)
     start_calls, stopped = calls_used(), False
     for _, _id, info in rows:
@@ -554,7 +572,8 @@ def sweep(cur, already):
         note, juicy, reason = lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
         checked += 1
         if not note:
-            reasons[reason] += 1
+            if reason:
+                reasons[reason] += 1
             continue
         with_data += 1
         _judged["keys"].add(k)
@@ -574,6 +593,8 @@ def sweep(cur, already):
         if reasons:
             top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
             msg += "\nNo matchup data for " + str(sum(reasons.values())) + ": " + ", ".join(f"{n}× {r}" for r, n in top)
+        if _suppressed["n"]:
+            msg += f"\n🔇 {_suppressed['n']} held back: recent games disagreed with the projection"
         if stopped:
             msg += f"\n⏸️ Stopped early to protect today's calls: {skipped} lines left for the next sweep"
         msg += f"\nAPI-Football calls today: {calls_used()}/{CAP}"
