@@ -9,23 +9,38 @@ KEY = os.getenv("API_FOOTBALL_KEY")
 SEASON = os.getenv("SEASON", "2026")
 EDGE_PCT = float(os.getenv("EDGE_PCT", "0.10"))  # gap needed, as % of the line
 MIN_EDGE = float(os.getenv("MIN_EDGE", "2"))     # but never less than this many passes
-CAP = int(os.getenv("DAILY_CAP", "90"))       # max API calls per UTC day
+CAP = int(os.getenv("DAILY_CAP", "90"))       # max API calls per UTC day (Pro: 5000)
 H2H_GAMES = int(os.getenv("H2H_GAMES", "3"))
 SUB_RATE = float(os.getenv("SUB_RATE", "0.5"))        # flag if subbed off in at least this share of appearances
 SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearances to judge
 SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minutes per appearance is below this
+MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = line alerts only, no API-Football calls
+LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
+LEAGUE_CHECK_ON_START = os.getenv("LEAGUE_CHECK_ON_START", "true").lower() == "true"
+LEAGUE_CHECK = os.getenv(
+    "LEAGUE_CHECK",
+    "England:Premier League,Spain:La Liga,Italy:Serie A,Germany:Bundesliga,France:Ligue 1,"
+    "Brazil:Serie A,USA:Major League Soccer,Netherlands:Eredivisie,Portugal:Primeira Liga,"
+    "World:UEFA Champions League,World:UEFA Nations League,World:World Cup - Qualification Europe")
 BASE = "https://v3.football.api-sports.io"
 
 _cache = {}
 _last_err = {}
 _calls = {"day": None, "n": 0}
+_locked = {"until": 0.0}      # set when the free plan blocks the season, so we stop wasting calls
 
 
 CALL_SPACING = float(os.getenv("CALL_SPACING", "6.5"))   # seconds between calls; free plan = 10/min. On Pro use 0.3
 _last = {"t": 0.0}
 
 
+def _season_locked():
+    return time.time() < _locked["until"]
+
+
 def _get(path, params):
+    if "season" in params and _season_locked():
+        raise RuntimeError("free plan: season locked")
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if _calls["day"] != today:
         _calls["day"], _calls["n"] = today, 0
@@ -44,7 +59,10 @@ def _get(path, params):
     r.raise_for_status()
     j = r.json()
     if j.get("errors"):
-        raise RuntimeError(str(j["errors"]))
+        msg = str(j["errors"])
+        if "Free plans" in msg:
+            _locked["until"] = time.time() + 1800
+        raise RuntimeError(msg)
     return j.get("response", [])
 
 
@@ -113,31 +131,48 @@ def _team_id(name):
 
 
 def _player(name):
+    if _season_locked():
+        raise RuntimeError("free plan: season locked")      # don't spend a call on a lookup that will be blocked
     parts = _clean(name).split()
-    if len(parts) < 2 or len(parts[-1]) < 3:
+    if not parts or len(parts[-1]) < 3:
         return None
+    one_name = len(parts) == 1                    # Rodri, Pedri, most Brazilians
     first, last = parts[0].lower(), parts[-1].lower()
-    pid = None
     cands = _get("/players/profiles", {"search": last})
+    pid = None
     for p in cands:
         pl = p["player"]
-        if _clean(pl.get("lastname") or "").lower() == last and \
-           _clean(pl.get("firstname") or "").lower().startswith(first[0]):
+        fn = _clean(pl.get("firstname") or "").lower()
+        ln = _clean(pl.get("lastname") or "").lower()
+        nm = _clean(pl.get("name") or "").lower()
+        ln_tail = ln.split()[-1] if ln else ""    # "De Bruyne" -> "bruyne", "van Dijk" -> "dijk"
+        nm_tail = nm.split()[-1] if nm else ""
+        if one_name:
+            ok = last in (fn, ln, nm)
+        else:
+            ok = ((ln == last or ln_tail == last) and fn[:1] == first[:1]) or \
+                 (nm_tail == last and nm[:1] == first[:1])
+        if ok:
             pid = pl["id"]
+            print("player matched:", name, "->", pl.get("firstname"), pl.get("lastname"), "id", pid)
             break
     if not pid:
-        print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname")) for c in cands][:6])
+        print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname"),
+                                              c["player"].get("name")) for c in cands][:8])
         return None
     data = _get("/players", {"id": pid, "season": SEASON})
     passes = mins = apps = sub_out = 0
+    pos = ""
     for s in (data[0]["statistics"] if data else []):
         passes += s["passes"]["total"] or 0
         mins += s["games"]["minutes"] or 0
         apps += s["games"].get("appearences") or 0
         sub_out += (s.get("substitutes") or {}).get("out") or 0
+        pos = pos or (s["games"].get("position") or "")
     if mins < 180:
         return None
-    return pid, passes / (mins / 90), {"apps": apps, "sub_out": sub_out, "avg_min": mins / apps if apps else 0}
+    return pid, passes / (mins / 90), {"apps": apps, "sub_out": sub_out,
+                                       "avg_min": mins / apps if apps else 0, "pos": pos}
 
 
 def _passes(stat_block):
@@ -148,8 +183,8 @@ def _passes(stat_block):
 
 
 def _form(tid):
-    """Avg passes a team makes, and passes opponents make against it (last 5)."""
-    made, allowed = [], []
+    """Avg passes a team makes, passes opponents make against it (last 5), and the fixture ids used."""
+    made, allowed, fids = [], [], []
     for f in _get("/fixtures", {"team": tid, "last": 5}):
         if f["fixture"]["status"]["short"] not in ("FT", "AET", "PEN"):
             continue
@@ -159,9 +194,28 @@ def _form(tid):
         if mine and theirs and mine[0] is not None and theirs[0] is not None:
             made.append(mine[0])
             allowed.append(theirs[0])
+            fids.append(f["fixture"]["id"])
     if len(made) < 3:
         return None
-    return sum(made) / len(made), sum(allowed) / len(allowed)
+    return sum(made) / len(made), sum(allowed) / len(allowed), fids
+
+
+def _last5(pid, fids):
+    """The player's own passes in his team's last games (shared fixture lookups are cached per fixture)."""
+    out = []
+    for fid in fids:
+        blocks = _cached(("fxp", fid), lambda fid=fid: _get("/fixtures/players", {"fixture": fid}))
+        if blocks is None:
+            raise RuntimeError("daily call cap or rate limit hit while reading last games")
+        for team_block in blocks:
+            for pl in team_block["players"]:
+                if pl["player"]["id"] == pid:
+                    st = pl["statistics"][0]
+                    mins = st["games"]["minutes"] or 0
+                    tot = st["passes"]["total"]
+                    if mins >= 45 and tot is not None:
+                        out.append(tot)
+    return out
 
 
 def _h2h(pid, tid, oid):
@@ -185,20 +239,60 @@ def calls_used():
     return _calls["n"]
 
 
+def _err_text(e):
+    e = str(e)
+    if "Free plans" in e or "season locked" in e:
+        return "free plan can't read this season (needs Pro)"
+    if "cap" in e:
+        return "daily call cap reached"
+    if "429" in e:
+        return "rate limit (too many calls per minute)"
+    return e[:50]
+
+
 def _why(*keys):
     for k in keys:
         e = _last_err.get(k)
         if e:
-            if "cap" in e:
-                return "daily call cap reached"
-            if "429" in e:
-                return "rate limit (too many calls per minute)"
-            return e[:50]
+            return _err_text(e)
     return "not found"
+
+
+def league_report():
+    """One call at startup: which leagues have player + team passes for this season."""
+    if not KEY or not MATCHUP:
+        return ""
+    try:
+        data = _get("/leagues", {"season": SEASON})
+    except Exception as e:
+        return f"📋 League coverage check failed: {_err_text(e)}"
+    idx = {}
+    for it in data:
+        idx[((it.get("country") or {}).get("name", "").lower(), it["league"]["name"].lower())] = it
+    lines = []
+    for item in LEAGUE_CHECK.split(","):
+        if ":" not in item:
+            continue
+        country, lname = (x.strip() for x in item.split(":", 1))
+        it = idx.get((country.lower(), lname.lower()))
+        if not it:
+            lines.append(f"❓ {country} – {lname}: not found")
+            continue
+        seasons = it.get("seasons") or []
+        s = next((x for x in seasons if str(x.get("year")) == str(SEASON)), seasons[-1] if seasons else {})
+        fx = (s.get("coverage") or {}).get("fixtures") or {}
+        p, t = bool(fx.get("statistics_players")), bool(fx.get("statistics_fixtures"))
+        icon = "✅" if (p and t) else ("🟡" if (p or t) else "❌")
+        lines.append(f"{icon} {country} – {lname}"
+                     + ("" if icon == "✅" else f" (player stats {'yes' if p else 'no'}, team stats {'yes' if t else 'no'})"))
+    return (f"📋 Data coverage for {SEASON} (✅ = player + team passes available, not guaranteed every game)\n"
+            + "\n".join(lines))
 
 
 def lean_ex(name, team, opp, line):
     """Returns (note, juicy, reason). note is '' when stats are unavailable, and reason says why."""
+    if not MATCHUP:
+        return "", False, ""
     if not KEY:
         return "", False, "no API-Football key"
     if not team or not opp:
@@ -218,8 +312,8 @@ def lean_ex(name, team, opp, line):
     if not (tf and of):
         return "", False, "recent games: " + _why(fk1, fk2)
 
-    team_made, _ = tf
-    _, opp_allowed = of
+    team_made, _, fids = tf
+    _, opp_allowed, _ = of
     expected_team = (team_made + opp_allowed) / 2
     factor = expected_team / team_made if team_made else 1
     proj = per90 * factor
@@ -236,17 +330,30 @@ def lean_ex(name, team, opp, line):
         tag = "🔥 JUICY — lean OVER" if gap > 0 else "🧊 JUICY — lean UNDER"
     else:
         tag = "⚪ no clear edge"
+
+    is_gk = (risk.get("pos") or "").lower() == "goalkeeper"
+    gk_line = "\n   🧤 Goalkeeper: passes depend on his team's style and the flow of the game." if is_gk else ""
+
+    last5_line = ""
+    if juicy or is_gk or LAST5_ALL:
+        l5 = _cached(("last5", pid, tid), lambda: _last5(pid, fids)) or []
+        if len(l5) >= 3:
+            over = sum(1 for x in l5 if x > line)
+            last5_line = (f"\n   • Last {len(l5)} games: {', '.join(str(x) for x in l5)}"
+                          f" → over {line} in {over}/{len(l5)}")
+
     sub_line = ""
-    if juicy and risk["apps"] >= SUB_MIN_APPS:
+    if juicy and not is_gk and risk["apps"] >= SUB_MIN_APPS:
         rate = risk["sub_out"] / risk["apps"]
         if rate >= SUB_RATE or risk["avg_min"] < SUB_AVG_MIN:
             facts = f"subbed off in {risk['sub_out']} of {risk['apps']} apps, avg {risk['avg_min']:.0f} min"
             sub_line = (f"\n   ⚠️ Sub risk: {facts}. Passes can fall short." if gap > 0
                         else f"\n   ℹ️ Often subbed off ({facts}). That supports the under.")
+    direction = ("OVER" if gap > 0 else "UNDER") if juicy else False
     return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
             f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
             f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
-            f"{h2h_line}{sub_line}", juicy, "")
+            f"{gk_line}{h2h_line}{last5_line}{sub_line}", direction, "")
 
 
 def lean(name, team, opp, line):
@@ -342,28 +449,40 @@ def format_start_time(iso_str):
         return iso_str
 
 
+def _dir_prefix(direction):
+    if direction == "OVER":
+        return "🔥 **JUICY — LEAN OVER** — "
+    if direction == "UNDER":
+        return "🧊 **JUICY — LEAN UNDER** — "
+    return ""
+
+
 def send_grouped_embeds(props_to_send):
     if not WEBHOOK_URL or not props_to_send:
         return
 
     grouped = defaultdict(list)
     for info in props_to_send:
-        grouped[info["game_name"]].append(info)
+        grouped[(info["game_name"], info.get("juicy") or False)].append(info)   # over and under picks post separately
 
-    for game_name, props in grouped.items():
+    for (game_name, direction), props in grouped.items():
         start_str = format_start_time(props[0].get("game_start", ""))
         lines_text = "\n".join(
-            [f"{p['label']} — Passes `{p['line']}`{p['note']}" for p in props])
+            [f"{_dir_prefix(p.get('juicy'))}{p['label']} — Passes `{p['line']}`{p['note']}" for p in props])
 
-        any_juicy = any(p.get("juicy") for p in props)
+        if direction == "OVER":
+            title, color = "🔥 Captain Hook — JUICY — LEAN OVER", 3066993
+        elif direction == "UNDER":
+            title, color = "🧊 Captain Hook — JUICY — LEAN UNDER", 10181046
+        else:
+            title, color = "🚨 Captain Hook — SOCCER PASSES", 3447003
         embed = {
-            "title": ("🔥 Captain Hook — JUICY SOCCER PASSES SPOT" if any_juicy
-                      else "🚨 Captain Hook — SOCCER PASSES"),
+            "title": title,
             "description": f"**{game_name}**\n{lines_text}",
-            "color": 3066993 if any_juicy else 3447003,
+            "color": color,
             "fields": [{"name": "Starts", "value": start_str, "inline": False}],
             "footer": {"text": f"PrizePicks • {len(props)} prop(s) • {INSTANCE}"},
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         requests.post(WEBHOOK_URL,
                       json={"username": "Captain Hook", "embeds": [embed]},
@@ -373,8 +492,8 @@ def send_grouped_embeds(props_to_send):
 SWEEP_MINUTES = int(os.getenv("SWEEP_MINUTES", "120"))          # how often to re-check the WHOLE board
 SWEEP_HOURS_AHEAD = float(os.getenv("SWEEP_HOURS_AHEAD", "30"))   # only games starting within this window
 SWEEP_SUMMARY = os.getenv("SWEEP_SUMMARY", "true").lower() == "true"
-SWEEP_CALL_BUDGET = int(os.getenv("SWEEP_CALL_BUDGET", "25"))     # max API calls one sweep may start
-SWEEP_KEEP = int(os.getenv("SWEEP_KEEP", "30"))                   # daily calls always kept for new/moved alerts
+SWEEP_CALL_BUDGET = int(os.getenv("SWEEP_CALL_BUDGET", "25"))     # max API calls one sweep may start (Pro: 1500)
+SWEEP_KEEP = int(os.getenv("SWEEP_KEEP", "30"))                   # daily calls always kept for new/moved alerts (Pro: 300)
 _judged = {"day": None, "keys": set()}
 
 
@@ -387,6 +506,8 @@ def _start_dt(info):
 
 def sweep(cur, already):
     """Check EVERY line on the board (soonest games first), not only new or moved ones."""
+    if not MATCHUP:
+        return
     now = datetime.now(timezone.utc)
     if _judged["day"] != now.date():
         _judged.update(day=now.date(), keys=set())
@@ -418,7 +539,7 @@ def sweep(cur, already):
         _judged["keys"].add(k)
         if juicy:
             item = info.copy()
-            item.update(note=note, juicy=True, label=f"🔎 {info['name']}")
+            item.update(note=note, juicy=juicy, label=f"🔎 {info['name']}")
             juicy_items.append(item)
             already.add(k)
     if juicy_items:
@@ -426,7 +547,9 @@ def sweep(cur, already):
     print(f"Sweep: {len(rows)} lines in window, checked {checked}, with data {with_data}, juicy {len(juicy_items)}")
     if SWEEP_SUMMARY and WEBHOOK_URL:
         msg = (f"🔎 Board sweep: {len(rows)} lines in the next {SWEEP_HOURS_AHEAD:g}h • checked {checked} • "
-               f"matchup data for {with_data} • 🔥 juicy: {len(juicy_items)}")
+               f"matchup data for {with_data} • juicy: {len(juicy_items)} "
+               f"(🔥 {sum(1 for i in juicy_items if i['juicy'] == 'OVER')} over, "
+               f"🧊 {sum(1 for i in juicy_items if i['juicy'] == 'UNDER')} under)")
         if reasons:
             top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
             msg += "\nNo matchup data for " + str(sum(reasons.values())) + ": " + ", ".join(f"{n}× {r}" for r, n in top)
@@ -437,7 +560,7 @@ def sweep(cur, already):
 
 
 def main():
-    print(f"Captain Hook - SOCCER Passes Attempted - MATCHUP MODE - instance {INSTANCE}")
+    print(f"Captain Hook - SOCCER Passes Attempted - MATCHUP {'MODE' if MATCHUP else 'OFF'} - instance {INSTANCE}")
 
     seen = None
     while seen is None:
@@ -448,11 +571,19 @@ def main():
             time.sleep(60)
     print(f"Initial tracking {len(seen)} SOCCER passes lines")
     if WEBHOOK_URL:
+        extra = f"\n{status()}" if MATCHUP else "\nMatchup lookups are OFF (line alerts only)."
         r = requests.post(WEBHOOK_URL, json={
             "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
-                       f"All new lines and bumps post; juicy matchups are flagged 🔥.\n{status()}"}, timeout=10)
+                       f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER.{extra}"}, timeout=10)
         print(f"Startup message -> Discord status {r.status_code}")
         print(status())
+        if LEAGUE_CHECK_ON_START and MATCHUP:
+            try:
+                rep = league_report()
+                if rep:
+                    requests.post(WEBHOOK_URL, json={"content": rep[:1900]}, timeout=10)
+            except Exception as e:
+                print(f"League report failed: {e}")
     else:
         print("WEBHOOK_URL is not set")
 
