@@ -18,6 +18,7 @@ MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = lin
 LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
 RECENT_CHECK = os.getenv("RECENT_CHECK", "true").lower() == "true"  # hold back a 🔥/🧊 if recent games disagree with it
 RECENT_AGREE = float(os.getenv("RECENT_AGREE", "0.5"))              # share of recent games that must be on the lean side
+MAX_GAP_RATIO = float(os.getenv("MAX_GAP_RATIO", "0.5"))            # projection more than this far from the line = data problem, no tag
 LEAGUE_CHECK_ON_START = os.getenv("LEAGUE_CHECK_ON_START", "true").lower() == "true"
 LEAGUE_CHECK = os.getenv(
     "LEAGUE_CHECK",
@@ -142,7 +143,7 @@ def _player(name):
     one_name = len(parts) == 1                    # Rodri, Pedri, most Brazilians
     first, last = parts[0].lower(), parts[-1].lower()
     cands = _get("/players/profiles", {"search": last})
-    pid = None
+    exact, initial_only, chosen = [], [], None
     for p in cands:
         pl = p["player"]
         fn = _clean(pl.get("firstname") or "").lower()
@@ -151,27 +152,46 @@ def _player(name):
         ln_tail = ln.split()[-1] if ln else ""    # "De Bruyne" -> "bruyne", "van Dijk" -> "dijk"
         nm_tail = nm.split()[-1] if nm else ""
         if one_name:
-            ok = last in (fn, ln, nm)
-        else:
-            ok = ((ln == last or ln_tail == last) and fn[:1] == first[:1]) or \
-                 (nm_tail == last and nm[:1] == first[:1])
-        if ok:
-            pid = pl["id"]
-            print("player matched:", name, "->", pl.get("firstname"), pl.get("lastname"), "id", pid)
-            break
-    if not pid:
+            if last in (fn, ln, nm):              # Rodri, Pedri, most Brazilians
+                chosen = pl
+                break
+            continue
+        if (ln == last or ln_tail == last) and fn[:1] == first[:1]:
+            fn0 = fn.split()[0] if fn else ""
+            if fn0 and (fn0 == first or fn0.startswith(first) or first.startswith(fn0)):
+                exact.append(pl)                  # first name really matches (Elliot = Elliot, Alex = Alexander)
+            else:
+                initial_only.append(pl)           # only the first letter matches
+        elif nm_tail == last and nm[:1] == first[:1]:
+            initial_only.append(pl)
+    if not one_name:
+        if exact:
+            chosen = exact[0]
+        elif len(initial_only) == 1:              # accept an initial-only match only if there is exactly one
+            chosen = initial_only[0]
+    if not chosen:
         print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname"),
-                                              c["player"].get("name")) for c in cands][:8])
+                                              c["player"].get("name")) for c in cands][:8],
+              f"(initial-only candidates: {len(initial_only)})")
         return None
+    pid = chosen["id"]
+    print("player matched:", name, "->", chosen.get("firstname"), chosen.get("lastname"), "id", pid)
     data = _get("/players", {"id": pid, "season": SEASON})
     passes = mins = apps = sub_out = 0
     pos = ""
+    blocks = []
     for s in (data[0]["statistics"] if data else []):
-        passes += s["passes"]["total"] or 0
-        mins += s["games"]["minutes"] or 0
+        pos = pos or (s["games"].get("position") or "")
+        pt = (s.get("passes") or {}).get("total")
+        mn = s["games"]["minutes"] or 0
+        blocks.append(((s.get("league") or {}).get("name"), mn, pt))
+        if not pt:                                # no passing data for this competition: skip its minutes too,
+            continue                              # otherwise his passes per 90 comes out far too low
+        passes += pt
+        mins += mn
         apps += s["games"].get("appearences") or 0
         sub_out += (s.get("substitutes") or {}).get("out") or 0
-        pos = pos or (s["games"].get("position") or "")
+    print("player stats:", name, "(league, minutes, passes)", blocks)
     if mins < 180:
         return None
     return pid, passes / (mins / 90), {"apps": apps, "sub_out": sub_out,
@@ -340,6 +360,10 @@ def lean_ex(name, team, opp, line):
         tag = "🔥 JUICY — lean OVER" if gap > 0 else "🧊 JUICY — lean UNDER"
     else:
         tag = "⚪ no clear edge"
+
+    if juicy and MAX_GAP_RATIO and abs(gap) / max(line, 1) > MAX_GAP_RATIO:
+        _suppressed["n"] += 1                       # a gap this big almost always means bad data, not a real edge
+        return "", False, ""
 
     is_gk = (risk.get("pos") or "").lower() == "goalkeeper"
     gk_line = "\n   🧤 Goalkeeper: passes depend on his team's style and the flow of the game." if is_gk else ""
@@ -594,7 +618,7 @@ def sweep(cur, already):
             top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
             msg += "\nNo matchup data for " + str(sum(reasons.values())) + ": " + ", ".join(f"{n}× {r}" for r, n in top)
         if _suppressed["n"]:
-            msg += f"\n🔇 {_suppressed['n']} held back: recent games disagreed with the projection"
+            msg += f"\n🔇 {_suppressed['n']} held back: projection looked unreliable or recent games disagreed"
         if stopped:
             msg += f"\n⏸️ Stopped early to protect today's calls: {skipped} lines left for the next sweep"
         msg += f"\nAPI-Football calls today: {calls_used()}/{CAP}"
