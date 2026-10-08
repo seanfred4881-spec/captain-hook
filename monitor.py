@@ -961,7 +961,8 @@ def _post_recap(date_label, members):
     _save_record()
     tw, tl = _rec["w"], _rec["l"]
     foot = (f"\n\nTonight: **{w}-{l}**" + (f" (+{v} void)" if v else "") + (f" (+{u} not graded)" if u else "")
-            + f"\n**Record: {tw}-{tl}**" + (f" ({round(100 * tw / (tw + tl))}%)" if (tw + tl) else ""))
+            + "\n\n**Record**" + (f" ({round(100 * tw / (tw + tl))}%)" if (tw + tl) else "")
+            + f"\n✅ {tw} wins\n❌ {tl} losses")
     embed = {"title": f"📋 Captain Hook — results — {date_label}", "description": ("\n".join(lines) + foot)[:4000],
              "color": 15844367, "footer": {"text": "Graded on passes attempted • ➖ = did not play (void) • " + INSTANCE},
              "timestamp": datetime.now(timezone.utc).isoformat()}
