@@ -1,3 +1,4 @@
+# Captain Hook v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -135,7 +136,62 @@ def _team_id(name):
     return None
 
 
-def _player(name):
+_STOP = {"fc", "sc", "ec", "cf", "ac", "as", "fk", "sk", "cd", "ca", "club", "the", "de", "da", "do"}
+
+
+def _team_like(a, b):
+    """True if two team names look like the same club (PrizePicks vs API-Football spellings)."""
+    ta = {w for w in _clean(a).lower().split() if w not in _STOP and len(w) >= 3}
+    tb = {w for w in _clean(b).lower().split() if w not in _STOP and len(w) >= 3}
+    if ta & tb:
+        return True
+    return any(len(x) >= 4 and len(y) >= 4 and (x in y or y in x) for x in ta for y in tb)
+
+
+def _pdata(pid):
+    """A player's season stats (cached, so checking a club and reading stats cost one call)."""
+    data = _cached(("pdata", pid), lambda: _get("/players", {"id": pid, "season": SEASON}))
+    if data is None:
+        raise RuntimeError("daily call cap or rate limit hit while reading player stats")
+    return data
+
+
+def _pick_by_team(cands, team):
+    """Several players share this name: keep the one whose season stats include PrizePicks' team."""
+    for pl in cands[:4]:
+        for s in (_pdata(pl["id"]) or [{}])[0].get("statistics", []):
+            if _team_like(team, (s.get("team") or {}).get("name") or ""):
+                return pl
+    return None
+
+
+def _scan(cands, first, last, one_name):
+    """Sort API profile candidates into: first name really matches, only the initial matches, or one-name hits."""
+    exact, initial_only, singles = [], [], []
+    for p in cands:
+        pl = p["player"]
+        fn = _clean(pl.get("firstname") or "").lower()
+        ln = _clean(pl.get("lastname") or "").lower()
+        nm = _clean(pl.get("name") or "").lower()
+        ln_tail = ln.split()[-1] if ln else ""    # "De Bruyne" -> "bruyne", "van Dijk" -> "dijk"
+        ln_head = ln.split()[0] if ln else ""     # "Saldivia Vazquez" -> "saldivia" (Spanish double surnames)
+        nm_tail = nm.split()[-1] if nm else ""
+        if one_name:
+            if last in (fn, ln, nm):              # Rodri, Pedri, most Brazilians
+                singles.append(pl)
+            continue
+        if (ln == last or ln_tail == last or ln_head == last) and fn[:1] == first[:1]:
+            fn0 = fn.split()[0] if fn else ""
+            if fn0 and (fn0 == first or fn0.startswith(first) or first.startswith(fn0)):
+                exact.append(pl)                  # first name really matches (Elliot = Elliot, Alex = Alexander)
+            else:
+                initial_only.append(pl)           # only the first letter matches
+        elif nm_tail == last and nm[:1] == first[:1]:
+            initial_only.append(pl)
+    return exact, initial_only, singles
+
+
+def _player(name, team=""):
     if _season_locked():
         raise RuntimeError("free plan: season locked")      # don't spend a call on a lookup that will be blocked
     parts = _clean(name).split()
@@ -144,40 +200,34 @@ def _player(name):
     one_name = len(parts) == 1                    # Rodri, Pedri, most Brazilians
     first, last = parts[0].lower(), parts[-1].lower()
     cands = _get("/players/profiles", {"search": last})
-    exact, initial_only, chosen = [], [], None
-    for p in cands:
-        pl = p["player"]
-        fn = _clean(pl.get("firstname") or "").lower()
-        ln = _clean(pl.get("lastname") or "").lower()
-        nm = _clean(pl.get("name") or "").lower()
-        ln_tail = ln.split()[-1] if ln else ""    # "De Bruyne" -> "bruyne", "van Dijk" -> "dijk"
-        nm_tail = nm.split()[-1] if nm else ""
-        if one_name:
-            if last in (fn, ln, nm):              # Rodri, Pedri, most Brazilians
-                chosen = pl
-                break
-            continue
-        if (ln == last or ln_tail == last) and fn[:1] == first[:1]:
-            fn0 = fn.split()[0] if fn else ""
-            if fn0 and (fn0 == first or fn0.startswith(first) or first.startswith(fn0)):
-                exact.append(pl)                  # first name really matches (Elliot = Elliot, Alex = Alexander)
-            else:
-                initial_only.append(pl)           # only the first letter matches
-        elif nm_tail == last and nm[:1] == first[:1]:
-            initial_only.append(pl)
-    if not one_name:
-        if exact:
-            chosen = exact[0]
-        elif len(initial_only) == 1:              # accept an initial-only match only if there is exactly one
-            chosen = initial_only[0]
+    exact, initial_only, singles = _scan(cands, first, last, one_name)
+    if not one_name and not exact and len(parts) >= 2:
+        # common surnames (Santos, Silva, Souza) fill the first page with the wrong people: try the full name once
+        try:
+            more = _get("/players/profiles", {"search": " ".join(parts)})
+        except RuntimeError as e:
+            if "cap" in str(e) or "429" in str(e) or "season locked" in str(e):
+                raise                             # real limits: let the caller retry later, don't cache "not found"
+            more = []                             # API rejected this search style: keep the first result as is
+        if more:
+            cands = cands + more
+            exact, initial_only, singles = _scan(cands, first, last, one_name)
+    chosen = None
+    pool = singles if one_name else exact
+    if len(pool) > 1 and team:                    # same name, different players: the club decides
+        chosen = _pick_by_team(pool, team)
+    elif pool:
+        chosen = pool[0]
+    elif not one_name and len(initial_only) == 1:   # accept an initial-only match only if there is exactly one
+        chosen = initial_only[0]
     if not chosen:
         print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname"),
                                               c["player"].get("name")) for c in cands][:8],
-              f"(initial-only candidates: {len(initial_only)})")
+              f"(same-name players: {len(pool)}, initial-only: {len(initial_only)}, team wanted: {team})")
         return None
     pid = chosen["id"]
     print("player matched:", name, "->", chosen.get("firstname"), chosen.get("lastname"), "id", pid)
-    data = _get("/players", {"id": pid, "season": SEASON})
+    data = _pdata(pid)
     passes = mins = apps = sub_out = 0
     pos = ""
     blocks = []
@@ -192,7 +242,7 @@ def _player(name):
         mins += mn
         apps += s["games"].get("appearences") or 0
         sub_out += (s.get("substitutes") or {}).get("out") or 0
-    print("player stats:", name, "(league, minutes, passes)", blocks)
+    print("player stats:", name, "position:", pos or "?", "(league, minutes, passes)", blocks)
     if mins < 180:
         return None
     return pid, passes / (mins / 90), {"apps": apps, "sub_out": sub_out,
@@ -241,6 +291,26 @@ def _form(tid):
             "red_in": any(r[3] for r in use)}       # red-card games still counted (too few clean games)
 
 
+_fields_logged = {"done": False}
+
+
+def _log_fields(blocks):
+    """Once per run, print every stat field the API gives for a player in a game (shows if clearances/saves exist)."""
+    if _fields_logged["done"]:
+        return
+    try:
+        for team_block in blocks or []:
+            for pl in team_block.get("players", []):
+                st = (pl.get("statistics") or [None])[0]
+                if st:
+                    shape = {k: (sorted(v.keys()) if isinstance(v, dict) else type(v).__name__) for k, v in st.items()}
+                    print("API player stat fields:", shape)
+                    _fields_logged["done"] = True
+                    return
+    except Exception as e:
+        print("could not log stat fields:", e)
+
+
 def _last5(pid, fids):
     """The player's own passes in his team's last games (shared fixture lookups are cached per fixture)."""
     out = []
@@ -248,6 +318,7 @@ def _last5(pid, fids):
         blocks = _cached(("fxp", fid), lambda fid=fid: _get("/fixtures/players", {"fixture": fid}))
         if blocks is None:
             raise RuntimeError("daily call cap or rate limit hit while reading last games")
+        _log_fields(blocks)
         for team_block in blocks:
             for pl in team_block["players"]:
                 if pl["player"]["id"] == pid:
@@ -256,6 +327,31 @@ def _last5(pid, fids):
                     tot = st["passes"]["total"]
                     if mins >= 45 and tot is not None:
                         out.append(tot)
+    return out
+
+
+def _gk_vs(oid, fids):
+    """Passes attempted by the goalkeepers who FACED this team in its recent games (other opponents, not just this one).
+    Reuses the same per-fixture lookups the last-games check caches, so keepers on the same board share the calls."""
+    out = []
+    for fid in fids:
+        blocks = _cached(("fxp", fid), lambda fid=fid: _get("/fixtures/players", {"fixture": fid}))
+        if blocks is None:
+            raise RuntimeError("daily call cap or rate limit hit while reading keeper games")
+        _log_fields(blocks)
+        for team_block in blocks:
+            if (team_block.get("team") or {}).get("id") == oid:
+                continue                                   # we want the OTHER side's keeper
+            best = None
+            for pl in team_block["players"]:
+                st = pl["statistics"][0]
+                if (st["games"].get("position") or "") != "G":
+                    continue
+                mins, tot = st["games"]["minutes"] or 0, (st.get("passes") or {}).get("total")
+                if mins >= 60 and tot is not None and (best is None or mins > best[0]):
+                    best = (mins, tot)
+            if best:
+                out.append(best[1])
     return out
 
 
@@ -341,8 +437,8 @@ def lean_ex(name, team, opp, line):
         return "", False, "no API-Football key"
     if not team or not opp:
         return "", False, "PrizePicks gave no team/opponent"
-    pk, tk, ok = ("player", name), ("team", team), ("team", opp)
-    p = _cached(pk, lambda: _player(name))
+    pk, tk, ok = ("player", name, team), ("team", team), ("team", opp)
+    p = _cached(pk, lambda: _player(name, team))
     if not p:                                      # no player data -> don't spend calls on team lookups
         return "", False, "player: " + _why(pk)
     tid = _cached(tk, lambda: _team_id(team))
@@ -377,6 +473,16 @@ def lean_ex(name, team, opp, line):
         d, tot, mins = hd["last"]
         h2h_line += f"\n   • Last meeting: {tot} passes in {mins} min ({d})"
 
+    is_gk = (risk.get("pos") or "").lower() == "goalkeeper"
+    gkv, gk_vs_line = [], ""
+    if is_gk:                                        # keepers: how many passes did keepers facing THIS team attempt lately?
+        gkv = _cached(("gkvs", oid), lambda: _gk_vs(oid, of["fids"])) or []
+        if len(gkv) >= 3:
+            proj = 0.5 * proj + 0.5 * (sum(gkv) / len(gkv))
+            gk_over = sum(1 for x in gkv if x > line)
+            gk_vs_line = (f"\n   • Keepers facing {opp} lately: {', '.join(str(x) for x in gkv)}"
+                          f" → over {line} in {gk_over}/{len(gkv)}")
+
     gap = proj - line
     juicy = abs(gap) >= max(EDGE_PCT * line, MIN_EDGE)
     if juicy:
@@ -388,8 +494,8 @@ def lean_ex(name, team, opp, line):
         _suppressed["n"] += 1                       # a gap this big almost always means bad data, not a real edge
         return "", False, ""
 
-    is_gk = (risk.get("pos") or "").lower() == "goalkeeper"
-    gk_line = "\n   🧤 Goalkeeper: passes depend on his team's style and the flow of the game." if is_gk else ""
+    gk_line = ("\n   🧤 Goalkeeper: passes depend on his team's style and the flow of the game." if is_gk else "")
+    gk_line += gk_vs_line
 
     last5_line = ""
     l5 = []
@@ -407,6 +513,10 @@ def lean_ex(name, team, opp, line):
         if len(l5) >= 3:                                   # most recent games must be on the lean side of the line
             hits = sum(1 for x in l5 if (x > line) == lean_over)
             disagree = hits / len(l5) < RECENT_AGREE
+        if len(gkv) >= 4:                                  # keepers vs this opponent must lean the same way too
+            gk_hits = sum(1 for x in gkv if (x > line) == lean_over)
+            if gk_hits / len(gkv) < RECENT_AGREE:
+                disagree = True
         lm = hd["last"]
         if lm and lm[2] >= 60 and (lm[1] > line) != lean_over:   # last full meeting went the other way
             disagree = True
@@ -554,6 +664,11 @@ def send_grouped_embeds(props_to_send):
         grouped[(info["game_name"], info.get("juicy") or False)].append(info)   # over and under picks post separately
 
     for (game_name, direction), props in grouped.items():
+        for p in props:
+            try:
+                _track(p)                     # v12: remember every tagged pick so the nightly recap can grade it
+            except Exception as e:
+                print("recap tracking failed:", e)
         start_str = format_start_time(props[0].get("game_start", ""))
         lines_text = "\n".join(
             [f"{_dir_prefix(p.get('juicy'))}{p['label']} — Passes `{p['line']}`{p['note']}" for p in props])
@@ -649,8 +764,249 @@ def sweep(cur, already):
         _post({"content": msg})
 
 
+
+# ===== NIGHTLY RESULTS RECAP (v12) =====
+# Remembers every 🔥/🧊 pick the bot posts. After the games finish it reads the final passes from API-Football,
+# grades each pick (✅ cashed, ❌ missed, ➖ player did not play = void) and posts ONE recap per night.
+RECAP = os.getenv("RECAP_ENABLED", "true").lower() == "true"
+RECAP_TZ = os.getenv("RECAP_TZ", "America/New_York")                       # which clock decides what counts as "tonight"
+RECAP_POST_HOUR = int(os.getenv("RECAP_POST_HOUR", "9"))                   # the recap posts at this hour (local) the NEXT morning; -1 = as soon as the games are done
+RECAP_DAY_CUTOFF = int(os.getenv("RECAP_DAY_CUTOFF_HOUR", "6"))            # a game that kicks off before this hour counts as the previous night
+RECAP_AFTER_MIN = int(os.getenv("RECAP_AFTER_MINUTES", "105"))             # start looking for a final score this long after kickoff
+RECAP_EVERY_MIN = int(os.getenv("RECAP_CHECK_MINUTES", "15"))              # how often to check unfinished games
+RECAP_MAX_WAIT_H = float(os.getenv("RECAP_MAX_WAIT_HOURS", "5"))           # post anyway this long after the last kickoff
+RECAP_KEEP = int(os.getenv("RECAP_KEEP_CALLS", "15"))                      # never let the recap use the last N calls of the day
+_ledger = {}
+_recap = {"next": 0.0}
+_fxs = {}                                                                  # (team id, date) -> (checked at, fixture)
+_fxp_done = {}                                                             # fixture id -> player stats, kept once the game is final
+FINAL = ("FT", "AET", "PEN")
+DEAD = ("PST", "CANC", "ABD", "AWD", "WO")                                 # the match was not played: void
+SYM = {"WIN": "✅", "LOSS": "❌", "VOID": "➖", "NODATA": "❔"}
+# Running record shown at the bottom of every recap. It starts from these Railway variables and is saved to a small file,
+# so a restart keeps it. A fresh deploy wipes the file: then it starts from the variables again, so keep them up to date.
+RECORD_FILE = os.getenv("RECORD_FILE", "captain_hook_record.json")
+_rec = {"w": 0, "l": 0, "v": 0}
+
+
+def _load_record():
+    base = {"w": int(os.getenv("RECORD_WINS", "0") or 0), "l": int(os.getenv("RECORD_LOSSES", "0") or 0),
+            "v": int(os.getenv("RECORD_VOIDS", "0") or 0)}
+    try:
+        import json
+        with open(RECORD_FILE) as fh:
+            saved = json.load(fh)
+        base = {k: int(saved.get(k, 0)) for k in ("w", "l", "v")}
+    except Exception:
+        pass                                                # no saved file yet: use the variables
+    _rec.update(base)
+
+
+def _save_record():
+    try:
+        import json
+        with open(RECORD_FILE, "w") as fh:
+            json.dump(_rec, fh)
+    except Exception as e:
+        print("could not save the record file:", e)
+
+
+def _tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(RECAP_TZ)
+    except Exception:
+        return timezone(timedelta(hours=-4))
+
+
+def _local(dt):
+    return dt.astimezone(_tz())
+
+
+def _bday(dt):
+    """The 'betting night' a kickoff belongs to: a 12:30 AM game still counts as the night before."""
+    return (_local(dt) - timedelta(hours=RECAP_DAY_CUTOFF)).date()
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _track(info):
+    if not RECAP or info.get("juicy") not in ("OVER", "UNDER"):
+        return
+    try:
+        line = float(info["line"])
+    except (TypeError, ValueError, KeyError):
+        return
+    key = (info["name"], info.get("game_name", ""), info["juicy"])
+    e = _ledger.get(key)
+    if e:
+        if line not in e["lines"]:
+            e["lines"].append(line)                         # the line moved and was posted again
+        return
+    team = info.get("team", "")
+    ph, th = _cache.get(("player", info["name"], team)), _cache.get(("team", team))
+    pv = ph[1] if ph else None
+    _ledger[key] = {"name": info["name"], "team": team, "opp": info.get("opp", ""), "dir": info["juicy"],
+                    "lines": [line], "game": info.get("game_name", ""),
+                    "start": _start_dt(info) or datetime.now(timezone.utc),
+                    "pid": pv[0] if pv else None, "tid": th[1] if th else None,
+                    "pos": ((pv[2] or {}).get("pos") or "") if pv else "",
+                    "state": "OPEN", "actual": None, "mins": None, "note": "", "recapped": False}
+
+
+def _grade(line, actual, direction):
+    if actual == line:
+        return "VOID"                                       # a push
+    return "WIN" if ((actual > line) == (direction == "OVER")) else "LOSS"
+
+
+def _fixture_for(e):
+    """The match this pick belongs to. Re-checked every few minutes until it is final."""
+    date = e["start"].astimezone(timezone.utc).strftime("%Y-%m-%d")
+    k = (e["tid"], date)
+    hit = _fxs.get(k)
+    if hit and (hit[1]["fixture"]["status"]["short"] in FINAL + DEAD or time.time() - hit[0] < RECAP_EVERY_MIN * 60 - 30):
+        return hit[1]
+    res = _get("/fixtures", {"team": e["tid"], "date": date})
+    if not res:
+        return None
+    pick = res[0]
+    if len(res) > 1:
+        for f in res:
+            names = [f["teams"]["home"]["name"], f["teams"]["away"]["name"]]
+            if any(_team_like(e["opp"], n) for n in names):
+                pick = f
+                break
+    _fxs[k] = (time.time(), pick)
+    return pick
+
+
+def _settle_one(e, now):
+    if now < e["start"] + timedelta(minutes=RECAP_AFTER_MIN):
+        return                                              # the game is still on, or just ended
+    if e["pid"] is None or e["tid"] is None:
+        if now > e["start"] + timedelta(hours=RECAP_MAX_WAIT_H):
+            e["state"], e["note"] = "NODATA", "could not match the player or team"
+        return
+    f = _fixture_for(e)
+    if not f:
+        return
+    st = f["fixture"]["status"]["short"]
+    if st in DEAD:
+        e["state"], e["note"] = "VOID", "match postponed or cancelled"
+        return
+    if st not in FINAL:
+        return                                              # still being played
+    fid = f["fixture"]["id"]
+    blocks = _fxp_done.get(fid)
+    if blocks is None:
+        blocks = _get("/fixtures/players", {"fixture": fid})
+        if not blocks:
+            return                                          # stats are not out yet, try again next round
+        _fxp_done[fid] = blocks
+    found = None
+    for tb in blocks:
+        for pl in tb.get("players", []):
+            if pl["player"]["id"] == e["pid"]:
+                found = pl["statistics"][0]
+    mins = ((found or {}).get("games") or {}).get("minutes") or 0
+    tot = ((found or {}).get("passes") or {}).get("total")
+    if found and mins > 0 and tot is not None:
+        e["actual"], e["mins"] = tot, mins
+        e["state"] = _grade(e["lines"][0], tot, e["dir"])
+        return
+    if found and mins > 0:
+        e["state"], e["note"] = "NODATA", "no pass stats for him"
+        return
+    e["state"], e["note"] = "VOID", ("did not play" if found else "not in the match stats")
+    if (e["pos"] or "").lower() == "goalkeeper":            # a keeper who did not start: show who played instead
+        best = None
+        for tb in blocks:
+            if (tb.get("team") or {}).get("id") != e["tid"]:
+                continue
+            for pl in tb.get("players", []):
+                s0 = pl["statistics"][0]
+                m2, t2 = (s0["games"].get("minutes") or 0), (s0.get("passes") or {}).get("total")
+                if (s0["games"].get("position") or "") == "G" and m2 > 0 and t2 is not None and (best is None or m2 > best[0]):
+                    best = (m2, t2, pl["player"].get("name", "?"))
+        if best:
+            e["note"] += f"; keeper who played: {best[2]} {best[1]} passes ({_grade(e['lines'][0], best[1], e['dir'])})"
+            e["shadow"] = _grade(e["lines"][0], best[1], e["dir"])
+
+
+def _entry_line(e):
+    sym = SYM.get(e["state"], "⏳")
+    txt = f"**{e['name']}** — {e['dir']} {e['lines'][0]:g} {sym}"
+    if e["state"] in ("WIN", "LOSS"):
+        txt += f" ({e['actual']} passes, {e['mins']}')"
+        for L in e["lines"][1:]:                           # picks that were posted again at a moved line
+            txt += f" · also at {L:g} {SYM[_grade(L, e['actual'], e['dir'])]}"
+    elif e["note"]:
+        txt += f" · {e['note']}"
+    return txt
+
+
+def _post_recap(date_label, members):
+    done = [e for e in members if e["state"] in ("WIN", "LOSS")]
+    w = sum(1 for e in done if e["state"] == "WIN")
+    l = len(done) - w
+    v = sum(1 for e in members if e["state"] == "VOID")
+    u = sum(1 for e in members if e["state"] == "NODATA")
+    lines = [_entry_line(e) for e in members]
+    _rec["w"] += w
+    _rec["l"] += l
+    _rec["v"] += v
+    _save_record()
+    tw, tl = _rec["w"], _rec["l"]
+    foot = (f"\n\nTonight: **{w}-{l}**" + (f" (+{v} void)" if v else "") + (f" (+{u} not graded)" if u else "")
+            + f"\n**Record: {tw}-{tl}**" + (f" ({round(100 * tw / (tw + tl))}%)" if (tw + tl) else ""))
+    embed = {"title": f"📋 Captain Hook — results — {date_label}", "description": ("\n".join(lines) + foot)[:4000],
+             "color": 15844367, "footer": {"text": "Graded on passes attempted • ➖ = did not play (void) • " + INSTANCE},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    _post({"username": "Captain Hook", "embeds": [embed]})
+    for e in members:
+        e["recapped"] = True
+    print(f"Recap posted for {date_label}: {w}-{l}-{v}, running record {_rec['w']}-{_rec['l']}-{_rec['v']}")
+
+
+def settle_and_recap():
+    if not RECAP or not _ledger or not WEBHOOK_URL:
+        return
+    now = _utcnow()
+    if CAP - calls_used() >= RECAP_KEEP:
+        for e in _ledger.values():
+            if e["state"] == "OPEN":
+                try:
+                    _settle_one(e, now)
+                except Exception as ex:
+                    print("recap settle failed:", e["name"], ex)
+                    if "cap" in str(ex) or "429" in str(ex):
+                        break
+    groups = defaultdict(list)
+    for e in _ledger.values():
+        if not e["recapped"]:
+            groups[_bday(e["start"])].append(e)
+    for d, members in sorted(groups.items()):
+        if RECAP_POST_HOUR >= 0:                            # wait for the morning after: late games (MLS) finish after midnight
+            post_at = datetime.combine(d + timedelta(days=1), datetime.min.time(), tzinfo=_tz()) + timedelta(hours=RECAP_POST_HOUR)
+            if now < post_at:
+                continue
+        if any(e["state"] == "OPEN" for e in members):
+            if now < max(e["start"] for e in members) + timedelta(hours=RECAP_MAX_WAIT_H):
+                continue                                    # still waiting on a game
+            for e in members:
+                if e["state"] == "OPEN":
+                    e["state"], e["note"] = "NODATA", "no final stats yet"
+        members.sort(key=lambda e: e["start"])
+        _post_recap(d.strftime("%a %b %d").replace(" 0", " "), members)
+
+
 def main():
     print(f"Captain Hook - SOCCER Passes Attempted - MATCHUP {'MODE' if MATCHUP else 'OFF'} - instance {INSTANCE}")
+    _load_record()
+    print(f"Running record starts at {_rec['w']}-{_rec['l']}-{_rec['v']} (wins-losses-voids)")
 
     seen = None
     while seen is None:
@@ -664,7 +1020,8 @@ def main():
         extra = f"\n{status()}" if MATCHUP else "\nMatchup lookups are OFF (line alerts only)."
         r = _post({
             "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
-                       f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER.{extra}"})
+                       f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER. "
+                       f"A results recap posts after the games finish.{extra}"})
         print(f"Startup message -> Discord status {r.status_code}")
         print(status())
         if LEAGUE_CHECK_ON_START and MATCHUP:
@@ -713,6 +1070,12 @@ def main():
                     sweep(cur, alerted)
                 except Exception as e:
                     print(f"Sweep failed: {e}")
+            if RECAP and time.time() >= _recap["next"]:
+                _recap["next"] = time.time() + RECAP_EVERY_MIN * 60
+                try:
+                    settle_and_recap()
+                except Exception as e:
+                    print(f"Recap failed: {e}")
         except Exception as e:
             print(f"Error {e}")
             time.sleep(5)
