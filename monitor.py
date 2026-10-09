@@ -16,6 +16,7 @@ H2H_GAMES = int(os.getenv("H2H_GAMES", "3"))
 SUB_RATE = float(os.getenv("SUB_RATE", "0.5"))        # flag if subbed off in at least this share of appearances
 SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearances to judge
 SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minutes per appearance is below this
+SUB_FADE_OVERS = os.getenv("SUB_FADE_OVERS", "false").lower() == "true"   # v13: an OVER with sub risk is NOT tagged juicy (an UNDER with sub risk still is, it supports the under)
 MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = line alerts only, no API-Football calls
 LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
 RECENT_CHECK = os.getenv("RECENT_CHECK", "true").lower() == "true"  # hold back a 🔥/🧊 if recent games disagree with it
@@ -206,7 +207,12 @@ def _player(name, team=""):
         return None
     one_name = len(parts) == 1                    # Rodri, Pedri, most Brazilians
     first, last = parts[0].lower(), parts[-1].lower()
-    cands = _get("/players/profiles", {"search": last})
+    q = last                                      # v13: API-Football search needs 4+ letters. "Le Fee" has a 3-letter last word, so search "le fee"
+    if len(q) < 4:
+        q = " ".join(parts[-2:]) if len(parts) >= 2 else ""
+    if len(q) < 4:
+        return None                               # one short name (3 letters): the API can't search it
+    cands = _get("/players/profiles", {"search": q})
     exact, initial_only, singles = _scan(cands, first, last, one_name)
     if not one_name and not exact and len(parts) >= 2:
         # common surnames (Santos, Silva, Souza) fill the first page with the wrong people: try the full name once
@@ -539,6 +545,9 @@ def lean_ex(name, team, opp, line):
         rate = risk["sub_out"] / risk["apps"]
         if rate >= SUB_RATE or risk["avg_min"] < SUB_AVG_MIN:
             facts = f"subbed off in {risk['sub_out']} of {risk['apps']} apps, avg {risk['avg_min']:.0f} min"
+            if gap > 0 and SUB_FADE_OVERS:
+                _suppressed["n"] += 1                       # v13: fade it. An over on a player who gets subbed off early is not worth it
+                return "", False, ""
             sub_line = (f"\n   ⚠️ Sub risk: {facts}. Passes can fall short." if gap > 0
                         else f"\n   ℹ️ Often subbed off ({facts}). That supports the under.")
     direction = ("OVER" if gap > 0 else "UNDER") if juicy else False
