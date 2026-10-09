@@ -1,4 +1,5 @@
-# Captain Hook v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
+# Captain Hook v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -114,9 +115,13 @@ ALIASES = {"turkiye": "Turkey", "türkiye": "Turkey", "bosnia and herzegovina": 
            "rep. of ireland": "Ireland", "republic of ireland": "Ireland"}   # PrizePicks vs API-Football spellings (extend as needed)
 
 
+_TRANSLIT = str.maketrans({"Đ": "Dj", "đ": "dj", "Ł": "L", "ł": "l", "Ø": "O", "ø": "o", "Æ": "Ae", "æ": "ae", "Œ": "Oe", "œ": "oe",
+                           "ß": "ss", "Ð": "D", "ð": "d", "Þ": "Th", "þ": "th", "ı": "i", "İ": "I"})   # letters accents-stripping can't fix (Đorđe -> Djordje)
+
+
 def _clean(s):
     """API-Football search only accepts plain letters and spaces. Strip accents, periods, hyphens, &, etc."""
-    s = unicodedata.normalize("NFKD", s or "")
+    s = unicodedata.normalize("NFKD", (s or "").translate(_TRANSLIT))
     s = "".join(c for c in s if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z ]", " ", s)).strip()
 
@@ -156,9 +161,9 @@ def _pdata(pid):
     return data
 
 
-def _pick_by_team(cands, team):
+def _pick_by_team(cands, team, n=4):
     """Several players share this name: keep the one whose season stats include PrizePicks' team."""
-    for pl in cands[:4]:
+    for pl in cands[:n]:
         for s in (_pdata(pl["id"]) or [{}])[0].get("statistics", []):
             if _team_like(team, (s.get("team") or {}).get("name") or ""):
                 return pl
@@ -179,6 +184,8 @@ def _scan(cands, first, last, one_name):
         if one_name:
             if last in (fn, ln, nm):              # Rodri, Pedri, most Brazilians
                 singles.append(pl)
+            elif last in (fn.split()[:1] + nm.split()[:1]):
+                initial_only.append(pl)           # v13: "Rayan" vs API "Rayan Vitor Simplicio Rocha": loose match, the club must confirm it
             continue
         if (ln == last or ln_tail == last or ln_head == last) and fn[:1] == first[:1]:
             fn0 = fn.split()[0] if fn else ""
@@ -220,6 +227,9 @@ def _player(name, team=""):
         chosen = pool[0]
     elif not one_name and len(initial_only) == 1:   # accept an initial-only match only if there is exactly one
         chosen = initial_only[0]
+
+    if not chosen and one_name and initial_only and team:   # v13: one-name player whose API name is longer ("Rayan" = "Rayan Vitor"): accept ONLY if his club matches
+        chosen = _pick_by_team(initial_only, team, 8)
     if not chosen:
         print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname"),
                                               c["player"].get("name")) for c in cands][:8],
@@ -545,6 +555,7 @@ def lean(name, team, opp, line):
 
 # ===== PRIZEPICKS MONITOR =====
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+JUICY_WEBHOOK_URL = os.getenv("JUICY_WEBHOOK_URL")      # v13: optional. A second Discord channel that gets ONLY the juicy picks (and the morning recap)
 INSTANCE = (os.getenv("RAILWAY_DEPLOYMENT_ID") or "not-railway")[:6]  # shows which copy posted
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -631,11 +642,11 @@ def format_start_time(iso_str):
         return iso_str
 
 
-def _post(payload):
+def _post(payload, url=None):
     """Post to Discord. If Discord says 'slow down' (429), wait the time it asks for and try again."""
     r = None
     for _ in range(4):
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        r = requests.post(url or WEBHOOK_URL, json=payload, timeout=10)
         if r.status_code != 429:
             return r
         try:
@@ -688,6 +699,11 @@ def send_grouped_embeds(props_to_send):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         _post({"username": "Captain Hook", "embeds": [embed]})
+        if JUICY_WEBHOOK_URL and direction:               # v13: juicy picks only (non-juicy rows have no direction)
+            try:
+                _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
+            except Exception as e:
+                print("juicy channel post failed:", e)
 
 
 SWEEP_MINUTES = int(os.getenv("SWEEP_MINUTES", "120"))          # how often to re-check the WHOLE board
@@ -967,6 +983,11 @@ def _post_recap(date_label, members):
              "color": 15844367, "footer": {"text": "Graded on passes attempted • ➖ = did not play (void) • " + INSTANCE},
              "timestamp": datetime.now(timezone.utc).isoformat()}
     _post({"username": "Captain Hook", "embeds": [embed]})
+    if JUICY_WEBHOOK_URL:
+        try:
+            _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
+        except Exception as e:
+            print("juicy channel recap post failed:", e)
     for e in members:
         e["recapped"] = True
     print(f"Recap posted for {date_label}: {w}-{l}-{v}, running record {_rec['w']}-{_rec['l']}-{_rec['v']}")
