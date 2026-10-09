@@ -564,6 +564,7 @@ def lean(name, team, opp, line):
 
 # ===== PRIZEPICKS MONITOR =====
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+JUICY_ALSO_MAIN = os.getenv("JUICY_ALSO_MAIN", "false").lower() == "true"   # v13: true = juicy picks ALSO post in the main channel (default: juicy channel only)
 JUICY_WEBHOOK_URL = os.getenv("JUICY_WEBHOOK_URL")      # v13: optional. A second Discord channel that gets ONLY the juicy picks (and the morning recap)
 INSTANCE = (os.getenv("RAILWAY_DEPLOYMENT_ID") or "not-railway")[:6]  # shows which copy posted
 HEADERS = {
@@ -707,12 +708,15 @@ def send_grouped_embeds(props_to_send):
             "footer": {"text": f"PrizePicks • {len(props)} prop(s) • {INSTANCE}"},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        _post({"username": "Captain Hook", "embeds": [embed]})
-        if JUICY_WEBHOOK_URL and direction:               # v13: juicy picks only (non-juicy rows have no direction)
+        sent_juicy = False
+        if JUICY_WEBHOOK_URL and direction:               # v13: juicy picks go to the juicy channel (non-juicy rows have no direction)
             try:
-                _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
+                rj = _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
+                sent_juicy = rj is not None and rj.status_code < 300
             except Exception as e:
                 print("juicy channel post failed:", e)
+        if not sent_juicy or JUICY_ALSO_MAIN or not direction:    # juicy picks skip the main channel, unless the juicy post failed (nothing is ever lost)
+            _post({"username": "Captain Hook", "embeds": [embed]})
 
 
 SWEEP_MINUTES = int(os.getenv("SWEEP_MINUTES", "120"))          # how often to re-check the WHOLE board
