@@ -725,6 +725,10 @@ SWEEP_SUMMARY = os.getenv("SWEEP_SUMMARY", "true").lower() == "true"
 SWEEP_CALL_BUDGET = int(os.getenv("SWEEP_CALL_BUDGET", "25"))     # max API calls one sweep may start (Pro: 1500)
 SWEEP_KEEP = int(os.getenv("SWEEP_KEEP", "30"))                   # daily calls always kept for new/moved alerts (Pro: 300)
 _judged = {"day": None, "keys": set()}
+# v13: after a restart the bot has forgotten which picks it already posted. The first sweep(s) therefore run SILENTLY: they re-learn the
+# juicy picks (and track them for the recap) but do not post them again. Turn off with WARMUP_SILENT=false.
+WARMUP_SILENT = os.getenv("WARMUP_SILENT", "true").lower() == "true"
+_warm = {"left": 3}                                                 # at most 3 silent sweeps (stops sooner once one finishes the whole board)
 
 
 def _start_dt(info):
@@ -734,8 +738,8 @@ def _start_dt(info):
         return None
 
 
-def sweep(cur, already):
-    """Check EVERY line on the board (soonest games first), not only new or moved ones."""
+def sweep(cur, already, silent=False):
+    """Check EVERY line on the board (soonest games first), not only new or moved ones. silent=True: learn the picks, post nothing."""
     if not MATCHUP:
         return
     now = datetime.now(timezone.utc)
@@ -774,11 +778,18 @@ def sweep(cur, already):
             item.update(note=note, juicy=juicy, label=f"🔎 {info['name']}")
             juicy_items.append(item)
             already.add(k)
-    if juicy_items:
+    if juicy_items and silent:
+        for it in juicy_items:                           # restart catch-up: remember them for the recap, but do not post them again
+            try:
+                _track(it)
+            except Exception as e:
+                print("recap tracking failed:", e)
+        print(f"Sweep (silent restart catch-up): {len(juicy_items)} juicy picks re-learned, not reposted")
+    elif juicy_items:
         send_grouped_embeds(juicy_items)
     print(f"Sweep: {len(rows)} lines in window, checked {checked}, with data {with_data}, juicy {len(juicy_items)}")
     if SWEEP_SUMMARY and WEBHOOK_URL:
-        msg = (f"🔎 Board sweep: {len(rows)} lines in the next {SWEEP_HOURS_AHEAD:g}h • checked {checked} • "
+        msg = (f"🔎 Board sweep{' (restart catch-up, juicy picks not reposted)' if silent else ''}: {len(rows)} lines in the next {SWEEP_HOURS_AHEAD:g}h • checked {checked} • "
                f"matchup data for {with_data} • juicy: {len(juicy_items)} "
                f"(🔥 {sum(1 for i in juicy_items if i['juicy'] == 'OVER')} over, "
                f"🧊 {sum(1 for i in juicy_items if i['juicy'] == 'UNDER')} under)")
@@ -791,6 +802,7 @@ def sweep(cur, already):
             msg += f"\n⏸️ Stopped early to protect today's calls: {skipped} lines left for the next sweep"
         msg += f"\nAPI-Football calls today: {calls_used()}/{CAP}"
         _post({"content": msg})
+    return stopped
 
 
 
@@ -1102,8 +1114,12 @@ def main():
             if time.time() >= next_sweep:
                 next_sweep = time.time() + SWEEP_MINUTES * 60
                 try:
-                    sweep(cur, alerted)
+                    silent = WARMUP_SILENT and _warm["left"] > 0
+                    stopped_early = sweep(cur, alerted, silent=silent)
+                    if silent:
+                        _warm["left"] = 0 if not stopped_early else _warm["left"] - 1   # a sweep that covered the whole board ends the catch-up
                 except Exception as e:
+                    _warm["left"] = max(0, _warm["left"] - 1)
                     print(f"Sweep failed: {e}")
             if RECAP and time.time() >= _recap["next"]:
                 _recap["next"] = time.time() + RECAP_EVERY_MIN * 60
