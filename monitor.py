@@ -1,4 +1,4 @@
-# Captain Hook v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re
 from datetime import datetime, timezone, timedelta
@@ -113,7 +113,18 @@ def status():
 ALIASES = {"turkiye": "Turkey", "türkiye": "Turkey", "bosnia and herzegovina": "Bosnia & Herzegovina",
            "united states": "USA", "usmnt": "USA", "uswnt": "USA", "south korea": "South Korea",
            "czechia": "Czech Republic", "n. ireland": "Northern Ireland",
-           "rep. of ireland": "Ireland", "republic of ireland": "Ireland"}   # PrizePicks vs API-Football spellings (extend as needed)
+           "rep. of ireland": "Ireland", "republic of ireland": "Ireland",
+           # v14: PrizePicks short club names -> full names API-Football understands ("Man Utd", "Spurs" were failing for every player)
+           "man utd": "Manchester United", "man united": "Manchester United", "man city": "Manchester City",
+           "spurs": "Tottenham", "tottenham hotspur": "Tottenham", "wolves": "Wolverhampton", "newcastle utd": "Newcastle",
+           "newcastle united": "Newcastle", "west ham utd": "West Ham", "west ham united": "West Ham",
+           "nott'm forest": "Nottingham Forest", "nottm forest": "Nottingham Forest", "forest": "Nottingham Forest",
+           "brighton & hove albion": "Brighton", "leeds utd": "Leeds", "leeds united": "Leeds", "sheffield utd": "Sheffield United",
+           "atletico madrid": "Atletico Madrid", "atl. madrid": "Atletico Madrid", "athletic club": "Athletic Club",
+           "real betis": "Betis", "bayern munich": "Bayern Munich", "inter milan": "Inter", "psg": "Paris Saint Germain",
+           "paris sg": "Paris Saint Germain", "b. dortmund": "Borussia Dortmund", "dortmund": "Borussia Dortmund",
+           "leverkusen": "Bayer Leverkusen", "gladbach": "Borussia Monchengladbach", "m'gladbach": "Borussia Monchengladbach",
+           "rb leipzig": "RB Leipzig", "ac milan": "AC Milan", "as roma": "AS Roma"}   # PrizePicks vs API-Football spellings (extend as needed)
 
 
 _TRANSLIT = str.maketrans({"Đ": "Dj", "đ": "dj", "Ł": "L", "ł": "l", "Ø": "O", "ø": "o", "Æ": "Ae", "æ": "ae", "Œ": "Oe", "œ": "oe",
@@ -214,6 +225,17 @@ def _player(name, team=""):
         return None                               # one short name (3 letters): the API can't search it
     cands = _get("/players/profiles", {"search": q})
     exact, initial_only, singles = _scan(cands, first, last, one_name)
+    if not one_name and not exact and not initial_only and len(last) < 4 and len(first) >= 4:
+        # v14: short surname ("van de Ven" -> "ven"): the API can't search it, so search the FIRST name and let the surname filter pick him
+        try:
+            more = _get("/players/profiles", {"search": first})
+        except RuntimeError as e:
+            if "cap" in str(e) or "429" in str(e) or "season locked" in str(e):
+                raise
+            more = []
+        if more:
+            cands = cands + more
+            exact, initial_only, singles = _scan(cands, first, last, one_name)
     if not one_name and not exact and len(parts) >= 2:
         # common surnames (Santos, Silva, Souza) fill the first page with the wrong people: try the full name once
         try:
