@@ -1,6 +1,6 @@
-# Captain Hook v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
-import requests, time, os, unicodedata, re
+import requests, time, os, unicodedata, re, math
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -17,6 +17,12 @@ SUB_RATE = float(os.getenv("SUB_RATE", "0.5"))        # flag if subbed off in at
 SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearances to judge
 SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minutes per appearance is below this
 SUB_FADE_OVERS = os.getenv("SUB_FADE_OVERS", "false").lower() == "true"   # v13: an OVER with sub risk is NOT tagged juicy (an UNDER with sub risk still is, it supports the under)
+PROP_SHOTS = os.getenv("PROP_SHOTS", "true").lower() == "true"       # v16: shots lines (posted ONLY when juicy). false = ignore them
+PROP_TACKLES = os.getenv("PROP_TACKLES", "true").lower() == "true"   # v16: tackles lines (posted ONLY when juicy)
+PROP_PROB = float(os.getenv("PROP_PROB", "0.70"))                    # v16: chance (Poisson) the lean side must have to be juicy
+PROP_MIN_MIN = float(os.getenv("PROP_MIN_MINUTES", "450"))           # v16: needs this many season minutes of data (about 5 full games)
+PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: share of his last games that must be on the lean side
+STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
 MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = line alerts only, no API-Football calls
 LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
 RECENT_CHECK = os.getenv("RECENT_CHECK", "true").lower() == "true"  # hold back a 🔥/🧊 if recent games disagree with it
@@ -96,6 +102,11 @@ def status():
     try:
         r = requests.get(BASE + "/status", headers={"x-apisports-key": KEY}, timeout=15)
         d = r.json().get("response", {})
+        if not isinstance(d, dict):                # v15: the API sometimes answers with an empty list (busy/limited): retry once
+            time.sleep(3)
+            d = requests.get(BASE + "/status", headers={"x-apisports-key": KEY}, timeout=15).json().get("response", {})
+        if not isinstance(d, dict):
+            return "API-Football status check: no usage info returned (will keep counting calls itself)"
         plan = d.get("subscription", {}).get("plan", "?")
         req = d.get("requests", {})
         try:                                  # sync our counter with the real usage, so restarts can't overshoot the daily limit
@@ -257,12 +268,12 @@ def _player(name, team=""):
         chosen = initial_only[0]
 
     if not chosen and one_name and initial_only and team:   # v13: one-name player whose API name is longer ("Rayan" = "Rayan Vitor"): accept ONLY if his club matches
-        chosen = _pick_by_team(initial_only, team, 8)
+        chosen = _pick_by_team(initial_only, team, 15)   # v15: 8 -> 15 (common names like Natan have many namesakes)
     if not chosen:
         print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname"),
                                               c["player"].get("name")) for c in cands][:8],
               f"(same-name players: {len(pool)}, initial-only: {len(initial_only)}, team wanted: {team})")
-        return None
+        raise RuntimeError(f"search '{q}': {len(cands)} found, none fit")   # v15: the Discord note now says what happened
     pid = chosen["id"]
     print("player matched:", name, "->", chosen.get("firstname"), chosen.get("lastname"), "id", pid)
     data = _pdata(pid)
@@ -282,7 +293,7 @@ def _player(name, team=""):
         sub_out += (s.get("substitutes") or {}).get("out") or 0
     print("player stats:", name, "position:", pos or "?", "(league, minutes, passes)", blocks)
     if mins < 180:
-        return None
+        raise RuntimeError(f"only {int(mins)} min of pass data this season")   # v15: say why instead of "not found"
     return pid, passes / (mins / 90), {"apps": apps, "sub_out": sub_out,
                                        "avg_min": mins / apps if apps else 0, "pos": pos}
 
@@ -291,6 +302,16 @@ def _passes(stat_block):
     for s in stat_block["statistics"]:
         if s["type"] == "Total passes":
             return s["value"] or 0
+    return None
+
+
+def _shots(stat_block):
+    for s in stat_block["statistics"]:
+        if s["type"] == "Total Shots":
+            try:
+                return int(s["value"] or 0)
+            except (TypeError, ValueError):
+                return None
     return None
 
 
@@ -306,24 +327,39 @@ def _red(stat_block):
 
 def _form(tid):
     """Avg passes a team makes, passes opponents make against it, and the fixtures used.
-    Games with a red card (either team) are left out when enough clean games remain, because
-    a red card wrecks the pass counts. Costs no extra calls: red cards come with the same stats."""
-    rows = []
-    for f in _get("/fixtures", {"team": tid, "last": FORM_GAMES}):
+    v15: looks at a few extra games so a cup match without stats can't sink the whole team, and when it
+    still can't find 3 usable games it says WHY in the Discord note (finished games vs games with pass stats).
+    Games with a red card (either team) are left out when enough clean games remain."""
+    fx = _get("/fixtures", {"team": tid, "last": FORM_GAMES + 4}) or []
+    fx = sorted(fx, key=lambda f: f["fixture"].get("timestamp") or 0, reverse=True)
+    rows, final, nostats = [], 0, 0
+    for f in fx:
         if f["fixture"]["status"]["short"] not in ("FT", "AET", "PEN"):
             continue
-        blocks = _get("/fixtures/statistics", {"fixture": f["fixture"]["id"]})
+        final += 1
+        if len(rows) >= FORM_GAMES:
+            continue
+        blocks = _get("/fixtures/statistics", {"fixture": f["fixture"]["id"]}) or []
         mine = [_passes(b) for b in blocks if b["team"]["id"] == tid]
         theirs = [_passes(b) for b in blocks if b["team"]["id"] != tid]
         if mine and theirs and mine[0] is not None and theirs[0] is not None:
             red = any(_red(b) > 0 for b in blocks)
-            rows.append((f["fixture"]["id"], mine[0], theirs[0], red))
+            ms = [_shots(b) for b in blocks if b["team"]["id"] == tid]
+            ts = [_shots(b) for b in blocks if b["team"]["id"] != tid]
+            rows.append((f["fixture"]["id"], mine[0], theirs[0], red,
+                         ms[0] if ms else None, ts[0] if ts else None))     # v16: team shots come with the same stats (no extra calls)
+        else:
+            nostats += 1
     clean = [r for r in rows if not r[3]]
     use = clean if len(clean) >= 3 else rows        # not enough clean games: fall back to all of them
     if len(use) < 3:
-        return None
+        raise RuntimeError(f"{len(use)} usable/{len(fx)} listed, {final} final, {nostats} no pass stats")
+    shm = [r[4] for r in use if r[4] is not None]
+    sha = [r[5] for r in use if r[5] is not None]
     return {"made": sum(r[1] for r in use) / len(use),
             "allowed": sum(r[2] for r in use) / len(use),
+            "sh_made": (sum(shm) / len(shm)) if len(shm) >= 3 else None,         # v16: team shots made / allowed per game
+            "sh_allowed": (sum(sha) / len(sha)) if len(sha) >= 3 else None,
             "fids": [r[0] for r in use],
             "red_out": len(rows) - len(use),        # red-card games left out
             "red_in": any(r[3] for r in use)}       # red-card games still counted (too few clean games)
@@ -579,6 +615,129 @@ def lean_ex(name, team, opp, line):
             f"{red_line}{gk_line}{h2h_line}{last5_line}{sub_line}", direction, "")
 
 
+# ===== SHOTS / TACKLES (v16) =====
+def _prop_rate(pid, stat):
+    """(total, minutes, appearances) for a player's season, counting only competitions where the API has that stat."""
+    data = _pdata(pid)
+    tot = mins = apps = 0
+    for s in (data[0]["statistics"] if data else []):
+        v = (s.get(stat) or {}).get("total")
+        if v is None:
+            continue
+        tot += v
+        mins += (s.get("games") or {}).get("minutes") or 0
+        apps += (s.get("games") or {}).get("appearences") or 0
+    return tot, mins, apps
+
+
+def _last_stat(pid, fids, stat):
+    """The player's own shots / tackles in his team's recent games (reuses the per-fixture lookups the passes check caches)."""
+    out = []
+    for fid in fids:
+        blocks = _cached(("fxp", fid), lambda fid=fid: _get("/fixtures/players", {"fixture": fid}))
+        if blocks is None:
+            raise RuntimeError("daily call cap or rate limit hit while reading last games")
+        for team_block in blocks:
+            for pl in team_block["players"]:
+                if pl["player"]["id"] == pid:
+                    st = pl["statistics"][0]
+                    mins = (st.get("games") or {}).get("minutes") or 0
+                    v = (st.get(stat) or {}).get("total")
+                    if mins >= 45 and v is not None:
+                        out.append(v)
+    return out
+
+
+def _p_over(line, mu):
+    """Chance of MORE than `line` (Poisson). Line 1.5 -> chance of 2 or more."""
+    k = int(math.floor(line))
+    mu = max(mu, 1e-6)
+    term = cdf = math.exp(-mu)
+    for i in range(1, k + 1):
+        term *= mu / i
+        cdf += term
+    return max(0.0, 1.0 - cdf)
+
+
+def lean_count(stat, name, team, opp, line):
+    """Shots / tackles. Returns (note, direction_or_False, reason). A line is only ever posted when it is juicy."""
+    if not MATCHUP:
+        return "", False, ""
+    if not KEY:
+        return "", False, "no API-Football key"
+    if not team or not opp:
+        return "", False, "PrizePicks gave no team/opponent"
+    label = STAT_LABEL[stat].lower()
+    pk, tk, ok = ("player", name, team), ("team", team), ("team", opp)
+    p = _cached(pk, lambda: _player(name, team))
+    if not p:
+        return "", False, "player: " + _why(pk)
+    pid, _p90, risk = p
+    if (risk.get("pos") or "").lower() == "goalkeeper":
+        return "", False, f"keeper ({label} not modelled)"
+    tot, mins, apps = _prop_rate(pid, stat)
+    if mins < PROP_MIN_MIN:
+        return "", False, f"only {int(mins)} min of {label} data"
+    tid = _cached(tk, lambda: _team_id(team))
+    oid = _cached(ok, lambda: _team_id(opp))
+    if not (tid and oid):
+        return "", False, "team: " + _why(tk, ok)
+    fk1, fk2 = ("form", tid), ("form", oid)
+    tf = _cached(fk1, lambda: _form(tid))
+    of = _cached(fk2, lambda: _form(oid))
+    if not (tf and of):
+        return "", False, "recent games: " + _why(fk1, fk2)
+
+    per90 = tot / (mins / 90)
+    avg_min = min(90.0, mins / apps) if apps else 75.0
+    factor, how = 1.0, "no matchup adjustment"
+    if stat == "shots" and tf.get("sh_made") and of.get("sh_allowed") is not None:
+        factor = max(0.6, min(1.6, ((tf["sh_made"] + of["sh_allowed"]) / 2) / tf["sh_made"]))
+        how = f"opp allows {of['sh_allowed']:.1f} shots, his team takes {tf['sh_made']:.1f}"
+    elif stat == "tackles" and tf.get("allowed") and of.get("made"):
+        factor = max(0.8, min(1.25, of["made"] / tf["allowed"]))     # an opponent that keeps the ball more than usual = more defending
+        how = f"opp makes {of['made']:.0f} passes, his team usually faces {tf['allowed']:.0f}"
+    proj = per90 * (avg_min / 90.0) * factor
+    po = _p_over(line, proj)
+    pu = 1.0 - po
+    if max(po, pu) < PROP_PROB:
+        return "", False, ""                                   # no clear edge: not posted at all
+    lean_over = po >= pu
+    chance = po if lean_over else pu
+
+    l5 = _cached(("lastc", stat, pid, tid), lambda: _last_stat(pid, tf["fids"], stat)) or []
+    l5_line = ""
+    if len(l5) >= 3:
+        hits = sum(1 for x in l5 if (x > line) == lean_over)
+        if hits / len(l5) < PROP_RECENT_AGREE:
+            _suppressed["n"] += 1
+            return "", False, ""                               # recent games disagree: stay quiet
+        l5_line = (f"\n   • Last {len(l5)} games: {', '.join(str(x) for x in l5)}"
+                   f" → over {line:g} in {sum(1 for x in l5 if x > line)}/{len(l5)}")
+
+    sub_line = ""
+    if lean_over and risk["apps"] >= SUB_MIN_APPS:
+        rate = risk["sub_out"] / risk["apps"]
+        if rate >= SUB_RATE or risk["avg_min"] < SUB_AVG_MIN:
+            if SUB_FADE_OVERS:
+                _suppressed["n"] += 1
+                return "", False, ""
+            sub_line = (f"\n   ⚠️ Sub risk: subbed off in {risk['sub_out']} of {risk['apps']} apps, "
+                        f"avg {risk['avg_min']:.0f} min. {STAT_LABEL[stat]} can fall short.")
+    tag = "🔥 JUICY — lean OVER" if lean_over else "🧊 JUICY — lean UNDER"
+    note = (f"\n   📊 Proj **{proj:.2f}** {label} vs line {line:g} → {tag} ({chance * 100:.0f}% chance)"
+            f"\n   • {per90:.2f}/90 × {avg_min:.0f}/90 min × {factor:.2f} matchup ({how}){l5_line}{sub_line}")
+    return note, ("OVER" if lean_over else "UNDER"), ""
+
+
+def lean_for(info):
+    """One entry point for every kind of line."""
+    stat = info.get("stat", "passes")
+    if stat == "passes":
+        return lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
+    return lean_count(stat, info["name"], info["team"], info["opp"], float(info["line"]))
+
+
 def lean(name, team, opp, line):
     note, juicy, _ = lean_ex(name, team, opp, line)
     return note, juicy
@@ -628,7 +787,13 @@ def parse(data):
         try:
             attrs = item["attributes"]
             stat = str(attrs.get("stat_display_name", "")).lower()
-            if "pass" not in stat or "attempt" not in stat:
+            if "pass" in stat and "attempt" in stat:
+                kind = "passes"
+            elif PROP_SHOTS and stat in ("shots", "shots attempted"):
+                kind = "shots"
+            elif PROP_TACKLES and stat == "tackles":
+                kind = "tackles"
+            else:
                 continue
 
             rel = item.get("relationships", {})
@@ -658,9 +823,13 @@ def parse(data):
                 "game_id": game_id,
                 "game_name": game_label,
                 "game_start": game_info["start"],
+                "stat": kind,
             }
         except Exception:
             continue
+    soccer_games = {v["game_id"] for v in cur.values() if v["stat"] == "passes" and v["game_id"]}
+    for k in [k for k, v in cur.items() if v["stat"] != "passes" and v["game_id"] not in soccer_games]:
+        del cur[k]                       # v16: shots/tackles only count in games that also have soccer Passes lines (keeps NFL/NHL out)
     return cur
 
 
@@ -714,7 +883,7 @@ def send_grouped_embeds(props_to_send):
                 print("recap tracking failed:", e)
         start_str = format_start_time(props[0].get("game_start", ""))
         lines_text = "\n".join(
-            [f"{_dir_prefix(p.get('juicy'))}{p['label']} — Passes `{p['line']}`{p['note']}" for p in props])
+            [f"{_dir_prefix(p.get('juicy'))}{p['label']} — {STAT_LABEL.get(p.get('stat', 'passes'), 'Passes')} `{p['line']}`{p['note']}" for p in props])
 
         if direction == "OVER":
             title, color = "🔥 Captain Hook — JUICY — LEAN OVER", 3066993
@@ -787,7 +956,7 @@ def sweep(cur, already, silent=False):
             stopped = True
             skipped += 1
             continue
-        note, juicy, reason = lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
+        note, juicy, reason = lean_for(info)
         checked += 1
         if not note:
             if reason:
@@ -815,6 +984,9 @@ def sweep(cur, already, silent=False):
                f"matchup data for {with_data} • juicy: {len(juicy_items)} "
                f"(🔥 {sum(1 for i in juicy_items if i['juicy'] == 'OVER')} over, "
                f"🧊 {sum(1 for i in juicy_items if i['juicy'] == 'UNDER')} under)")
+        by_stat = {k: sum(1 for i in juicy_items if i.get("stat", "passes") == k) for k in STAT_LABEL}
+        if by_stat["shots"] or by_stat["tackles"]:
+            msg += f"\n   by prop: passes {by_stat['passes']}, shots {by_stat['shots']}, tackles {by_stat['tackles']}"
         if reasons:
             top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
             msg += "\nNo matchup data for " + str(sum(reasons.values())) + ": " + ", ".join(f"{n}× {r}" for r, n in top)
@@ -902,7 +1074,8 @@ def _track(info):
         line = float(info["line"])
     except (TypeError, ValueError, KeyError):
         return
-    key = (info["name"], info.get("game_name", ""), info["juicy"])
+    stat = info.get("stat", "passes")
+    key = (info["name"], info.get("game_name", ""), info["juicy"], stat)
     e = _ledger.get(key)
     if e:
         if line not in e["lines"]:
@@ -911,7 +1084,7 @@ def _track(info):
     team = info.get("team", "")
     ph, th = _cache.get(("player", info["name"], team)), _cache.get(("team", team))
     pv = ph[1] if ph else None
-    _ledger[key] = {"name": info["name"], "team": team, "opp": info.get("opp", ""), "dir": info["juicy"],
+    _ledger[key] = {"name": info["name"], "team": team, "stat": stat, "opp": info.get("opp", ""), "dir": info["juicy"],
                     "lines": [line], "game": info.get("game_name", ""),
                     "start": _start_dt(info) or datetime.now(timezone.utc),
                     "pid": pv[0] if pv else None, "tid": th[1] if th else None,
@@ -975,13 +1148,13 @@ def _settle_one(e, now):
             if pl["player"]["id"] == e["pid"]:
                 found = pl["statistics"][0]
     mins = ((found or {}).get("games") or {}).get("minutes") or 0
-    tot = ((found or {}).get("passes") or {}).get("total")
+    tot = ((found or {}).get(e.get("stat", "passes")) or {}).get("total")
     if found and mins > 0 and tot is not None:
         e["actual"], e["mins"] = tot, mins
         e["state"] = _grade(e["lines"][0], tot, e["dir"])
         return
     if found and mins > 0:
-        e["state"], e["note"] = "NODATA", "no pass stats for him"
+        e["state"], e["note"] = "NODATA", f"no {e.get('stat', 'passes')} stats for him"
         return
     e["state"], e["note"] = "VOID", ("did not play" if found else "not in the match stats")
     if (e["pos"] or "").lower() == "goalkeeper":            # a keeper who did not start: show who played instead
@@ -1001,9 +1174,10 @@ def _settle_one(e, now):
 
 def _entry_line(e):
     sym = SYM.get(e["state"], "⏳")
-    txt = f"**{e['name']}** — {e['dir']} {e['lines'][0]:g} {sym}"
+    stat = e.get("stat", "passes")
+    txt = f"**{e['name']}** — {e['dir']} {e['lines'][0]:g}{'' if stat == 'passes' else ' ' + stat} {sym}"
     if e["state"] in ("WIN", "LOSS"):
-        txt += f" ({e['actual']} passes, {e['mins']}')"
+        txt += f" ({e['actual']} {stat}, {e['mins']}')"
         for L in e["lines"][1:]:                           # picks that were posted again at a moved line
             txt += f" · also at {L:g} {SYM[_grade(L, e['actual'], e['dir'])]}"
     elif e["note"]:
@@ -1023,11 +1197,15 @@ def _post_recap(date_label, members):
     _rec["v"] += v
     _save_record()
     tw, tl = _rec["w"], _rec["l"]
-    foot = (f"\n\nTonight: **{w}-{l}**" + (f" (+{v} void)" if v else "") + (f" (+{u} not graded)" if u else "")
+    per = {}
+    for e in done:
+        per.setdefault(e.get("stat", "passes"), [0, 0])[0 if e["state"] == "WIN" else 1] += 1
+    by_prop = ("\nBy prop: " + " • ".join(f"{STAT_LABEL[k]} {a}-{b}" for k, (a, b) in per.items())) if len(per) > 1 else ""
+    foot = (f"\n\nTonight: **{w}-{l}**" + (f" (+{v} void)" if v else "") + (f" (+{u} not graded)" if u else "") + by_prop
             + "\n\n**Record**" + (f" ({round(100 * tw / (tw + tl))}%)" if (tw + tl) else "")
             + f"\n✅ {tw} wins\n❌ {tl} losses")
     embed = {"title": f"📋 Captain Hook — results — {date_label}", "description": ("\n".join(lines) + foot)[:4000],
-             "color": 15844367, "footer": {"text": "Graded on passes attempted • ➖ = did not play (void) • " + INSTANCE},
+             "color": 15844367, "footer": {"text": "Graded on final stats (passes attempted, shots, tackles) • ➖ = did not play (void) • " + INSTANCE},
              "timestamp": datetime.now(timezone.utc).isoformat()}
     _post({"username": "Captain Hook", "embeds": [embed]})
     if JUICY_WEBHOOK_URL:
@@ -1084,11 +1262,15 @@ def main():
         except Exception as e:
             print(f"Initial fetch failed: {e}")
             time.sleep(60)
-    print(f"Initial tracking {len(seen)} SOCCER passes lines")
+    n_pass = sum(1 for v in seen.values() if v.get("stat") == "passes")
+    n_sh = sum(1 for v in seen.values() if v.get("stat") == "shots")
+    n_tk = sum(1 for v in seen.values() if v.get("stat") == "tackles")
+    print(f"Initial tracking {n_pass} SOCCER passes lines, {n_sh} shots lines, {n_tk} tackles lines (shots/tackles post only when juicy)")
     if WEBHOOK_URL:
         extra = f"\n{status()}" if MATCHUP else "\nMatchup lookups are OFF (line alerts only)."
         r = _post({
-            "content": f"✅ Captain Hook live: tracking {len(seen)} soccer Passes lines. "
+            "content": f"✅ Captain Hook live: tracking {n_pass} soccer Passes lines"
+                       + (f" + {n_sh} Shots / {n_tk} Tackles lines (these post ONLY when juicy)" if (n_sh or n_tk) else "") + ". "
                        f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER. "
                        f"A results recap posts after the games finish.{extra}"})
         print(f"Startup message -> Discord status {r.status_code}")
@@ -1115,7 +1297,9 @@ def main():
                 if not (is_new or moved):
                     continue
 
-                note, juicy, why = lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
+                note, juicy, why = lean_for(info)
+                if info.get("stat", "passes") != "passes" and not juicy:
+                    continue                                   # v16: shots/tackles are posted only when juicy
                 if not note and why:
                     note = f"\n   ℹ️ No matchup data: {why}"
 
