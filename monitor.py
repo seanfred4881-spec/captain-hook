@@ -1,4 +1,4 @@
-# Captain Hook v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math
 from datetime import datetime, timezone, timedelta
@@ -19,6 +19,10 @@ SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minute
 SUB_FADE_OVERS = os.getenv("SUB_FADE_OVERS", "false").lower() == "true"   # v13: an OVER with sub risk is NOT tagged juicy (an UNDER with sub risk still is, it supports the under)
 PROP_SHOTS = os.getenv("PROP_SHOTS", "true").lower() == "true"       # v16: shots lines (posted ONLY when juicy). false = ignore them
 PROP_TACKLES = os.getenv("PROP_TACKLES", "true").lower() == "true"   # v16: tackles lines (posted ONLY when juicy)
+PROP_UNDERS = os.getenv("PROP_UNDERS", "false").lower() == "true"    # v17: shots/tackles UNDER picks. Default false: PrizePicks usually offers only More on these
+PROP_STD_UNDERS = os.getenv("PROP_STD_UNDERS", "true").lower() == "true"   # v17: an UNDER on shots/tackles is allowed ONLY on standard lines (those show Less AND More). Demon/goblin lines are More-only
+PROP_GOBLINS = os.getenv("PROP_GOBLINS", "false").lower() == "true"  # v17: shots/tackles on GOBLIN lines (green 😈, easier line, More only). Default false: never posted
+PROP_DEMONS = os.getenv("PROP_DEMONS", "true").lower() == "true"    # v17: shots/tackles on DEMON lines (red 😈, harder line, More only). false = never posted
 PROP_PROB = float(os.getenv("PROP_PROB", "0.70"))                    # v16: chance (Poisson) the lean side must have to be juicy
 PROP_MIN_MIN = float(os.getenv("PROP_MIN_MINUTES", "450"))           # v16: needs this many season minutes of data (about 5 full games)
 PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: share of his last games that must be on the lean side
@@ -659,7 +663,7 @@ def _p_over(line, mu):
     return max(0.0, 1.0 - cdf)
 
 
-def lean_count(stat, name, team, opp, line):
+def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
     """Shots / tackles. Returns (note, direction_or_False, reason). A line is only ever posted when it is juicy."""
     if not MATCHUP:
         return "", False, ""
@@ -704,6 +708,9 @@ def lean_count(stat, name, team, opp, line):
         return "", False, ""                                   # no clear edge: not posted at all
     lean_over = po >= pu
     chance = po if lean_over else pu
+    if not lean_over and (only_over or not (PROP_UNDERS or (standard and PROP_STD_UNDERS))):
+        return "", False, ""                                   # v17: an under needs a standard line (Less + More). Demon/goblin lines, or lines of unknown type, never get one
+    pos = (risk.get("pos") or "").strip()
 
     l5 = _cached(("lastc", stat, pid, tid), lambda: _last_stat(pid, tf["fids"], stat)) or []
     l5_line = ""
@@ -726,7 +733,7 @@ def lean_count(stat, name, team, opp, line):
                         f"avg {risk['avg_min']:.0f} min. {STAT_LABEL[stat]} can fall short.")
     tag = "🔥 JUICY — lean OVER" if lean_over else "🧊 JUICY — lean UNDER"
     note = (f"\n   📊 Proj **{proj:.2f}** {label} vs line {line:g} → {tag} ({chance * 100:.0f}% chance)"
-            f"\n   • {per90:.2f}/90 × {avg_min:.0f}/90 min × {factor:.2f} matchup ({how}){l5_line}{sub_line}")
+            f"\n   • {pos + ': ' if pos else ''}{per90:.2f}/90 × {avg_min:.0f}/90 min × {factor:.2f} matchup ({how}){l5_line}{sub_line}")
     return note, ("OVER" if lean_over else "UNDER"), ""
 
 
@@ -734,8 +741,16 @@ def lean_for(info):
     """One entry point for every kind of line."""
     stat = info.get("stat", "passes")
     if stat == "passes":
-        return lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
-    return lean_count(stat, info["name"], info["team"], info["opp"], float(info["line"]))
+        note, juicy, why = lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
+        if juicy == "UNDER" and info.get("only_over"):          # v17: PrizePicks offers More only on this line: an under can't be played
+            note = note.replace("🧊 JUICY — lean UNDER", "⚪ leans under, but PrizePicks offers More only")
+            note += "\n   ℹ️ Under is not offered on this line."
+            return note, False, why
+        return note, juicy, why
+    odds = info.get("odds") or ""
+    if (odds == "goblin" and not PROP_GOBLINS) or (odds == "demon" and not PROP_DEMONS):
+        return "", False, ""                                    # v17: this kind of shots/tackles line is switched off: stay quiet
+    return lean_count(stat, info["name"], info["team"], info["opp"], float(info["line"]), bool(info.get("only_over")), info.get("odds") == "standard")
 
 
 def lean(name, team, opp, line):
@@ -814,7 +829,10 @@ def parse(data):
             else:
                 game_label = game_info["name"]
 
+            odds = str(attrs.get("odds_type") or "").lower()              # v17: standard / demon / goblin. Demon and goblin lines only offer More
             cur[item["id"]] = {
+                "odds": odds,
+                "only_over": odds in ("demon", "goblin"),
                 "name": pname,
                 "team": pteam,
                 "opp": opp,   # PrizePicks puts the opponent here
@@ -1265,6 +1283,11 @@ def main():
     n_pass = sum(1 for v in seen.values() if v.get("stat") == "passes")
     n_sh = sum(1 for v in seen.values() if v.get("stat") == "shots")
     n_tk = sum(1 for v in seen.values() if v.get("stat") == "tackles")
+    odds_mix = defaultdict(int)
+    for v in seen.values():
+        odds_mix[v.get("odds") or "(none)"] += 1
+    odds_txt = ", ".join(f"{k} {n}" for k, n in sorted(odds_mix.items(), key=lambda kv: -kv[1]))
+    print("PrizePicks line types:", odds_txt)
     print(f"Initial tracking {n_pass} SOCCER passes lines, {n_sh} shots lines, {n_tk} tackles lines (shots/tackles post only when juicy)")
     if WEBHOOK_URL:
         extra = f"\n{status()}" if MATCHUP else "\nMatchup lookups are OFF (line alerts only)."
@@ -1272,7 +1295,8 @@ def main():
             "content": f"✅ Captain Hook live: tracking {n_pass} soccer Passes lines"
                        + (f" + {n_sh} Shots / {n_tk} Tackles lines (these post ONLY when juicy)" if (n_sh or n_tk) else "") + ". "
                        f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER. "
-                       f"A results recap posts after the games finish.{extra}"})
+                       f"A results recap posts after the games finish.\nPrizePicks line types: {odds_txt} (demon/goblin = More only)"
+                       f"{extra}"})
         print(f"Startup message -> Discord status {r.status_code}")
         print(status())
         if LEAGUE_CHECK_ON_START and MATCHUP:
