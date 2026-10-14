@@ -1,8 +1,12 @@
-# Captain Hook v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+
+
+class DataGap(RuntimeError):
+    """v19: the stats site simply has no usable data for this player/team (not a temporary error). Remembered for CACHE_HOURS, not retried hourly."""
 
 
 # ===== MATCHUP / H2H STATS (API-Football) =====
@@ -11,7 +15,9 @@ KEY = os.getenv("API_FOOTBALL_KEY")
 SEASON = os.getenv("SEASON", "2026")
 EDGE_PCT = float(os.getenv("EDGE_PCT", "0.10"))  # gap needed, as % of the line
 MIN_EDGE = float(os.getenv("MIN_EDGE", "2"))     # but never less than this many passes
-CAP = int(os.getenv("DAILY_CAP", "90"))       # max API calls per UTC day (Pro: 5000)
+CAP = int(os.getenv("DAILY_CAP", "90"))
+CAP_FROM_PLAN = os.getenv("CAP_FROM_PLAN", "true").lower() == "true"   # v19: raise the cap to the plan's daily limit minus a small margin (7,500 plan -> 7,400)
+CAP_MARGIN = int(os.getenv("CAP_MARGIN", "100"))       # max API calls per UTC day (Pro: 5000)
 H2H_GAMES = int(os.getenv("H2H_GAMES", "3"))
 SUB_RATE = float(os.getenv("SUB_RATE", "0.5"))        # flag if subbed off in at least this share of appearances
 SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearances to judge
@@ -27,6 +33,8 @@ PROP_PROB = float(os.getenv("PROP_PROB", "0.70"))                    # v16: chan
 PROP_MIN_MIN = float(os.getenv("PROP_MIN_MINUTES", "450"))           # v16: needs this many season minutes of data (about 5 full games)
 PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: share of his last games that must be on the lean side
 STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
+DOM_HOLD = float(os.getenv("DOM_HOLD", "0"))      # v19: OFF by default (picks still post, with a warning). Set e.g. 1.30 to hold back picks against a much bigger possession side
+DOM_WARN = float(os.getenv("DOM_WARN", "1.15"))   # v19: ... from this ratio, a warning on the pick
 MARKET_WARN = float(os.getenv("MARKET_WARN", "0.20"))   # v18: a lean that fights the line by this share of his season average gets a warning (0 = off)
 MARKET_SKIP = float(os.getenv("MARKET_SKIP", "0.30"))   # v18: ... and by this much it is not tagged juicy at all (0 = off)
 CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
@@ -97,7 +105,11 @@ def _cached(key, fn):
     except Exception as e:
         print("stats error:", key[0], e)
         _last_err[key] = str(e)
-        val, ttl = None, (600 if ("429" in str(e) or "cap" in str(e)) else 3600)
+        if isinstance(e, DataGap):
+            ttl = CACHE_HOURS * 3600                    # v19: no data on the site = remember it, don't pay to ask again every sweep
+        else:
+            ttl = 600 if ("429" in str(e) or "cap" in str(e)) else 3600
+        val = None
     _cache[key] = (time.time() + ttl, val)
     return val
 
@@ -123,7 +135,14 @@ def status():
             _calls["n"] = max(_calls["n"], int(req.get("current") or 0))
         except (TypeError, ValueError):
             pass
-        return f"API-Football plan: {plan}, used {req.get('current')}/{req.get('limit_day')} today"
+        try:                                  # v19: use the whole plan, not just DAILY_CAP (no variable change needed)
+            global CAP
+            lim = int(req.get("limit_day") or 0)
+            if CAP_FROM_PLAN and lim > CAP_MARGIN and lim - CAP_MARGIN > CAP:
+                CAP = lim - CAP_MARGIN
+        except (TypeError, ValueError):
+            pass
+        return f"API-Football plan: {plan}, used {req.get('current')}/{req.get('limit_day')} today (bot cap {CAP})"
     except Exception as e:
         return f"API-Football status check failed: {e}"
 
@@ -193,14 +212,19 @@ def _pick_team(res, q):
 
 
 def _team_id(name):
-    alias = ALIASES.get(name.lower())
-    for q in ([alias] if alias else []) + [name, max(name.split(), key=len)]:
+    alias = ALIASES.get(name.lower()) or ALIASES.get(_clean(name).lower())
+    full = _clean(alias or name)
+    # v19: then each word of the name, longest first. "Bodø/Glimt" -> "Bodo Glimt" finds nothing (the API stores "Bodo/Glimt"), but "Glimt" does
+    words = sorted({w for w in _clean(name).split() if len(w) >= 4 and w.lower() not in _STOP}, key=len, reverse=True)
+    tried = set()
+    for q in ([alias] if alias else []) + [name] + words:
         q = _clean(q)
-        if len(q) < 3:
+        if len(q) < 3 or q.lower() in tried:
             continue
+        tried.add(q.lower())
         res = _get("/teams", {"search": q})
         if res:
-            return _pick_team(res, q)
+            return _pick_team(res, full)
     return None
 
 
@@ -313,10 +337,21 @@ def _player(name, team=""):
         print("player not matched:", name, [(c["player"].get("firstname"), c["player"].get("lastname"),
                                               c["player"].get("name")) for c in cands][:8],
               f"(same-name players: {len(pool)}, initial-only: {len(initial_only)}, team wanted: {team})")
-        raise RuntimeError(f"search '{q}': {len(cands)} found, none fit")   # v15: the Discord note now says what happened
+        raise DataGap(f"search '{q}': {len(cands)} found, none fit")   # v15: the Discord note now says what happened
     pid = chosen["id"]
     print("player matched:", name, "->", chosen.get("firstname"), chosen.get("lastname"), "id", pid)
     data = _pdata(pid)
+    if team and data:                             # v19: club check. A common name (Andrew Thomas) can match the wrong player
+        clubs = [((st.get("team") or {}).get("name") or "") for st in (data[0].get("statistics") or [])]
+        if clubs and not any(_team_like(team, c) for c in clubs):
+            others = [c for c in (exact + initial_only + singles) if c.get("id") != pid]
+            alt = _pick_by_team(others, team, 6) if others else None
+            if alt:
+                print("player club check: switched", name, "->", alt.get("firstname"), alt.get("lastname"), "id", alt["id"], "(first match played for", clubs, ")")
+                chosen, pid = alt, alt["id"]
+                data = _pdata(pid)
+            else:
+                print("player club check:", name, "matched player's clubs", clubs, "do not include", team, "- no better match, keeping him")
     passes = mins = apps = sub_out = 0
     pos = ""
     blocks = []
@@ -333,7 +368,7 @@ def _player(name, team=""):
         sub_out += (s.get("substitutes") or {}).get("out") or 0
     print("player stats:", name, "position:", pos or "?", "(league, minutes, passes)", blocks)
     if mins < 180:
-        raise RuntimeError(f"only {int(mins)} min of pass data this season")   # v15: say why instead of "not found"
+        raise DataGap(f"only {int(mins)} min of pass data this season")   # v15: say why instead of "not found"
     return pid, passes / (mins / 90), {"apps": apps, "sub_out": sub_out,
                                        "avg_min": mins / apps if apps else 0, "pos": pos}
 
@@ -393,7 +428,7 @@ def _form(tid):
     clean = [r for r in rows if not r[3]]
     use = clean if len(clean) >= 3 else rows        # not enough clean games: fall back to all of them
     if len(use) < 3:
-        raise RuntimeError(f"{len(use)} usable/{len(fx)} listed, {final} final, {nostats} no pass stats")
+        raise DataGap(f"{len(use)} usable/{len(fx)} listed, {final} final, {nostats} no pass stats")
     shm = [r[4] for r in use if r[4] is not None]
     sha = [r[5] for r in use if r[5] is not None]
     return {"made": sum(r[1] for r in use) / len(use),
@@ -552,19 +587,21 @@ def lean_ex(name, team, opp, line):
     if not team or not opp:
         return "", False, "PrizePicks gave no team/opponent"
     pk, tk, ok = ("player", name, team), ("team", team), ("team", opp)
-    p = _cached(pk, lambda: _player(name, team))
-    if not p:                                      # no player data -> don't spend calls on team lookups
-        return "", False, "player: " + _why(pk)
+    # v19: teams first. Team data is shared by every player of that club, so it is cheap; if a league has no pass data,
+    # we stop here instead of paying 2-3 calls for every one of its players.
     tid = _cached(tk, lambda: _team_id(team))
     oid = _cached(ok, lambda: _team_id(opp))
     if not (tid and oid):
         return "", False, "team: " + _why(tk, ok)
-    pid, per90, risk = p
     fk1, fk2 = ("form", tid), ("form", oid)
     tf = _cached(fk1, lambda: _form(tid))
     of = _cached(fk2, lambda: _form(oid))
     if not (tf and of):
         return "", False, "recent games: " + _why(fk1, fk2)
+    p = _cached(pk, lambda: _player(name, team))
+    if not p:
+        return "", False, "player: " + _why(pk)
+    pid, per90, risk = p
 
     team_made, fids = tf["made"], tf["fids"]
     opp_allowed = of["allowed"]
@@ -650,6 +687,21 @@ def lean_ex(name, team, opp, line):
             market_line = (f"\n   ⚠️ Line is {fight * 100:.0f}% {'below' if gap > 0 else 'above'} his season average ({per90:.0f}/90). "
                            f"PrizePicks may expect a {'quieter' if gap > 0 else 'bigger'} game than usual (one team dominating the ball?).")
 
+    dom_line = ""
+    if juicy and not is_gk and tf.get("made") and of.get("made"):
+        # v19: possession mismatch. The matchup factor averages the two teams, so a small club facing a giant (LASK v Liverpool,
+        # Galatasaray v Barcelona) looks "normal". Compare how many passes each side usually makes: if the opponent makes far more,
+        # his team will chase the ball -> no juicy OVER. Mirror: his team makes far more -> no juicy UNDER (Bayern v Viking).
+        ratio = of["made"] / tf["made"] if gap > 0 else tf["made"] / of["made"]
+        if DOM_HOLD and ratio >= DOM_HOLD:
+            _suppressed["n"] += 1
+            return "", False, ""
+        if DOM_WARN and ratio >= DOM_WARN:
+            risky = "🚨 RISKY" if ratio >= 1.30 else "⚠️ Risk"
+            dom_line = (f"\n   {risky}: possession mismatch, {'the opponent' if gap > 0 else 'his team'} usually makes {ratio:.2f}× the passes "
+                        f"({(of if gap > 0 else tf)['made']:.0f} vs {(tf if gap > 0 else of)['made']:.0f}). "
+                        f"{'His team may chase the ball all game.' if gap > 0 else 'His team may have the ball all game.'}")
+
     sub_line = ""
     if juicy and not is_gk and risk["apps"] >= SUB_MIN_APPS:
         rate = risk["sub_out"] / risk["apps"]
@@ -664,7 +716,7 @@ def lean_ex(name, team, opp, line):
     return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
             f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
             f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
-            f"{red_line}{gk_line}{h2h_line}{last5_line}{market_line}{sub_line}", direction, "")
+            f"{red_line}{gk_line}{h2h_line}{last5_line}{market_line}{dom_line}{sub_line}", direction, "")
 
 
 # ===== SHOTS / TACKLES (v16) =====
@@ -721,6 +773,15 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
         return "", False, "PrizePicks gave no team/opponent"
     label = STAT_LABEL[stat].lower()
     pk, tk, ok = ("player", name, team), ("team", team), ("team", opp)
+    tid = _cached(tk, lambda: _team_id(team))                 # v19: teams first (shared and cheap), players only if the teams have data
+    oid = _cached(ok, lambda: _team_id(opp))
+    if not (tid and oid):
+        return "", False, "team: " + _why(tk, ok)
+    fk1, fk2 = ("form", tid), ("form", oid)
+    tf = _cached(fk1, lambda: _form(tid))
+    of = _cached(fk2, lambda: _form(oid))
+    if not (tf and of):
+        return "", False, "recent games: " + _why(fk1, fk2)
     p = _cached(pk, lambda: _player(name, team))
     if not p:
         return "", False, "player: " + _why(pk)
@@ -730,15 +791,6 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
     tot, mins, apps = _prop_rate(pid, stat)
     if mins < PROP_MIN_MIN:
         return "", False, f"only {int(mins)} min of {label} data"
-    tid = _cached(tk, lambda: _team_id(team))
-    oid = _cached(ok, lambda: _team_id(opp))
-    if not (tid and oid):
-        return "", False, "team: " + _why(tk, ok)
-    fk1, fk2 = ("form", tid), ("form", oid)
-    tf = _cached(fk1, lambda: _form(tid))
-    of = _cached(fk2, lambda: _form(oid))
-    if not (tf and of):
-        return "", False, "recent games: " + _why(fk1, fk2)
 
     per90 = tot / (mins / 90)
     avg_min = min(90.0, mins / apps) if apps else 75.0
@@ -749,15 +801,28 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
     elif stat == "tackles" and tf.get("allowed") and of.get("made"):
         factor = max(0.8, min(1.25, of["made"] / tf["allowed"]))     # an opponent that keeps the ball more than usual = more defending
         how = f"opp makes {of['made']:.0f} passes, his team usually faces {tf['allowed']:.0f}"
-    proj = per90 * (avg_min / 90.0) * factor
-    po = _p_over(line, proj)
-    pu = 1.0 - po
-    if max(po, pu) < PROP_PROB:
+    # v19: possession mismatch (passes each side usually makes). A giant v a minnow (Liverpool v LASK): the averages say the minnow
+    # "allows few shots" because it plays weak teams at home, so the giant's strikers looked like unders. They all went over.
+    dom = (tf["made"] / of["made"]) if (tf.get("made") and of.get("made")) else 1.0
+    if stat == "shots" and dom >= 1.15 and factor < 1.0:
+        factor, how = 1.0, how + "; his team usually dominates the ball, so no reduction"
+    # v19: minutes. An OVER is judged on his usual minutes (he may be subbed); an UNDER is judged as if he plays the full game,
+    # because PrizePicks posts the line expecting him to start (Barcola: avg 46 min made 0.98 shots look like a safe under; he started and took 5).
+    proj_lo = per90 * (avg_min / 90.0) * factor
+    proj_hi = per90 * factor
+    po = _p_over(line, proj_lo)
+    pu = 1.0 - _p_over(line, proj_hi)
+    if po >= PROP_PROB:
+        lean_over, chance, proj = True, po, proj_lo
+    elif pu >= PROP_PROB:
+        lean_over, chance, proj = False, pu, proj_hi
+    else:
         return "", False, ""                                   # no clear edge: not posted at all
-    lean_over = po >= pu
-    chance = po if lean_over else pu
     if not lean_over and (only_over or not (PROP_UNDERS or (standard and PROP_STD_UNDERS))):
-        return "", False, ""                                   # v17: an under needs a standard line (Less + More). Demon/goblin lines, or lines of unknown type, never get one
+        return "", False, ""
+    if not lean_over and dom >= 1.15:
+        _suppressed["n"] += 1
+        return "", False, ""                                   # v19: never an UNDER on a player whose team should have most of the ball                                   # v17: an under needs a standard line (Less + More). Demon/goblin lines, or lines of unknown type, never get one
     pos = (risk.get("pos") or "").strip()
 
     l5 = _cached(("lastc", stat, pid, tid), lambda: _last_stat(pid, tf["fids"], stat)) or []
@@ -779,9 +844,14 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
                 return "", False, ""
             sub_line = (f"\n   ⚠️ Sub risk: subbed off in {risk['sub_out']} of {risk['apps']} apps, "
                         f"avg {risk['avg_min']:.0f} min. {STAT_LABEL[stat]} can fall short.")
+    dom_txt = ""
+    if lean_over and dom > 0 and 1 / dom >= 1.15:
+        dom_txt = (f"\n   {'🚨 RISKY' if 1 / dom >= 1.30 else '⚠️ Risk'}: possession mismatch, the opponent usually makes "
+                   f"{1 / dom:.2f}× the passes ({of['made']:.0f} vs {tf['made']:.0f}). His team may barely have the ball.")
+    sub_line += dom_txt
     tag = "🔥 JUICY — lean OVER" if lean_over else "🧊 JUICY — lean UNDER"
     note = (f"\n   📊 Proj **{proj:.2f}** {label} vs line {line:g} → {tag} ({chance * 100:.0f}% chance)"
-            f"\n   • {pos + ': ' if pos else ''}{per90:.2f}/90 × {avg_min:.0f}/90 min × {factor:.2f} matchup ({how}){l5_line}{sub_line}")
+            f"\n   • {pos + ': ' if pos else ''}{per90:.2f}/90 × {(str(round(avg_min)) + '/90 min') if lean_over else ('full game (usually ' + str(round(avg_min)) + ' min)')} × {factor:.2f} matchup ({how}){l5_line}{sub_line}")
     return note, ("OVER" if lean_over else "UNDER"), ""
 
 
