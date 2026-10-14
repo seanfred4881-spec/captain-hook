@@ -1,4 +1,4 @@
-# Captain Hook v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math
 from datetime import datetime, timezone, timedelta
@@ -18,7 +18,7 @@ SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearan
 SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minutes per appearance is below this
 SUB_FADE_OVERS = os.getenv("SUB_FADE_OVERS", "false").lower() == "true"   # v13: an OVER with sub risk is NOT tagged juicy (an UNDER with sub risk still is, it supports the under)
 PROP_SHOTS = os.getenv("PROP_SHOTS", "true").lower() == "true"       # v16: shots lines (posted ONLY when juicy). false = ignore them
-PROP_TACKLES = os.getenv("PROP_TACKLES", "true").lower() == "true"   # v16: tackles lines (posted ONLY when juicy)
+PROP_TACKLES = os.getenv("PROP_TACKLES", "false").lower() == "true"   # v18: OFF by default (PrizePicks posts almost only demon tackles lines; not worth the calls). true = turn back on
 PROP_UNDERS = os.getenv("PROP_UNDERS", "false").lower() == "true"    # v17: shots/tackles UNDER picks. Default false: PrizePicks usually offers only More on these
 PROP_STD_UNDERS = os.getenv("PROP_STD_UNDERS", "true").lower() == "true"   # v17: an UNDER on shots/tackles is allowed ONLY on standard lines (those show Less AND More). Demon/goblin lines are More-only
 PROP_GOBLINS = os.getenv("PROP_GOBLINS", "false").lower() == "true"  # v17: shots/tackles on GOBLIN lines (green 😈, easier line, More only). Default false: never posted
@@ -27,6 +27,9 @@ PROP_PROB = float(os.getenv("PROP_PROB", "0.70"))                    # v16: chan
 PROP_MIN_MIN = float(os.getenv("PROP_MIN_MINUTES", "450"))           # v16: needs this many season minutes of data (about 5 full games)
 PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: share of his last games that must be on the lean side
 STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
+MARKET_WARN = float(os.getenv("MARKET_WARN", "0.20"))   # v18: a lean that fights the line by this share of his season average gets a warning (0 = off)
+MARKET_SKIP = float(os.getenv("MARKET_SKIP", "0.30"))   # v18: ... and by this much it is not tagged juicy at all (0 = off)
+CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
 MATCHUP = os.getenv("MATCHUP_ENABLED", "true").lower() == "true"   # false = line alerts only, no API-Football calls
 LAST5_ALL = os.getenv("LAST5_ALL", "false").lower() == "true"      # true = show last-5 passes on every line (more calls)
 RECENT_CHECK = os.getenv("RECENT_CHECK", "true").lower() == "true"  # hold back a 🔥/🧊 if recent games disagree with it
@@ -89,7 +92,7 @@ def _cached(key, fn):
     if hit and time.time() < hit[0]:
         return hit[1]
     try:
-        val, ttl = fn(), 12 * 3600
+        val, ttl = fn(), CACHE_HOURS * 3600           # v18: how long the bot remembers a lookup (was 12h; 24h halves the repeat calls)
         _last_err.pop(key, None)
     except Exception as e:
         print("stats error:", key[0], e)
@@ -139,7 +142,14 @@ ALIASES = {"turkiye": "Turkey", "türkiye": "Turkey", "bosnia and herzegovina": 
            "real betis": "Betis", "bayern munich": "Bayern Munich", "inter milan": "Inter", "psg": "Paris Saint Germain",
            "paris sg": "Paris Saint Germain", "b. dortmund": "Borussia Dortmund", "dortmund": "Borussia Dortmund",
            "leverkusen": "Bayer Leverkusen", "gladbach": "Borussia Monchengladbach", "m'gladbach": "Borussia Monchengladbach",
-           "rb leipzig": "RB Leipzig", "ac milan": "AC Milan", "as roma": "AS Roma"}   # PrizePicks vs API-Football spellings (extend as needed)
+           "rb leipzig": "RB Leipzig", "ac milan": "AC Milan", "as roma": "AS Roma",
+           # v18: short names where a plain search also finds other clubs ("Villa" -> Villa Nova, "Sporting" -> other Sportings...)
+           "villa": "Aston Villa", "palace": "Crystal Palace", "sporting": "Sporting CP", "milan": "AC Milan", "roma": "AS Roma",
+           "inter": "Inter", "barcelona": "FC Barcelona", "atletico": "Atletico Madrid", "frankfurt": "Eintracht Frankfurt",
+           "bremen": "Werder Bremen", "mainz": "Mainz 05", "verona": "Hellas Verona", "porto": "FC Porto", "lens": "Lens",
+           "nice": "Nice", "lille": "Lille", "lyon": "Lyon", "monaco": "Monaco", "marseille": "Marseille", "newcastle": "Newcastle",
+           "brighton": "Brighton", "leeds": "Leeds", "fenerbahce": "Fenerbahce", "besiktas": "Besiktas", "galatasaray": "Galatasaray",
+           "man u": "Manchester United", "man. united": "Manchester United", "man. city": "Manchester City"}   # PrizePicks vs API-Football spellings (extend as needed)
 
 
 _TRANSLIT = str.maketrans({"Đ": "Dj", "đ": "dj", "Ł": "L", "ł": "l", "Ø": "O", "ø": "o", "Æ": "Ae", "æ": "ae", "Œ": "Oe", "œ": "oe",
@@ -153,6 +163,35 @@ def _clean(s):
     return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z ]", " ", s)).strip()
 
 
+_YOUTH = re.compile(r"\b(u\s?\d{2}|w|women|womens|ladies|fem|feminino|femenino|feminin|primavera|youth|juniors?|ii|iii|reserves?|castilla|amateur|academy|sub\s?\d{2})\b")
+
+
+def _pick_team(res, q):
+    """v18: choose the real club from a team search. The old code took the first result, which for 'Roma' can be a women's or youth side
+    that has only a couple of games on record ("0 usable/2 listed")."""
+    ql = _clean(q).lower()
+    qt = ql.split()
+    best, best_s = None, -999
+    for t in res:
+        info = t.get("team") or {}
+        nm = _clean(info.get("name") or "").lower()
+        nt = nm.split()
+        if nm == ql:
+            sc = 100
+        elif qt and all(w in nt for w in qt):
+            extra = [w for w in nt if w not in qt and w not in _STOP]
+            sc = 60 - 5 * len(extra)
+        elif qt and (nm in ql or ql in nm):
+            sc = 30
+        else:
+            sc = 10
+        if _YOUTH.search(nm) and not _YOUTH.search(ql):
+            sc -= 50                                  # women's / youth / reserve side with the same name
+        if sc > best_s:
+            best, best_s = info.get("id"), sc
+    return best
+
+
 def _team_id(name):
     alias = ALIASES.get(name.lower())
     for q in ([alias] if alias else []) + [name, max(name.split(), key=len)]:
@@ -161,10 +200,7 @@ def _team_id(name):
             continue
         res = _get("/teams", {"search": q})
         if res:
-            for t in res:
-                if _clean(t["team"]["name"]).lower() == q.lower():
-                    return t["team"]["id"]
-            return res[0]["team"]["id"]
+            return _pick_team(res, q)
     return None
 
 
@@ -602,6 +638,18 @@ def lean_ex(name, team, opp, line):
             _suppressed["n"] += 1
             return "", False, ""                           # post it as a plain passes line, no tag
 
+    market_line = ""
+    if juicy and not is_gk and per90 > 0:
+        # v18: PrizePicks sets lines knowing things the averages do not (one team dominating the ball, a rotation...). When the bot's lean fights a line
+        # that sits far from his own season average, trust the line more: warn, and past MARKET_SKIP do not tag it.
+        fight = ((per90 - line) if gap > 0 else (line - per90)) / per90
+        if MARKET_SKIP and fight >= MARKET_SKIP:
+            _suppressed["n"] += 1
+            return "", False, ""
+        if MARKET_WARN and fight >= MARKET_WARN:
+            market_line = (f"\n   ⚠️ Line is {fight * 100:.0f}% {'below' if gap > 0 else 'above'} his season average ({per90:.0f}/90). "
+                           f"PrizePicks may expect a {'quieter' if gap > 0 else 'bigger'} game than usual (one team dominating the ball?).")
+
     sub_line = ""
     if juicy and not is_gk and risk["apps"] >= SUB_MIN_APPS:
         rate = risk["sub_out"] / risk["apps"]
@@ -616,7 +664,7 @@ def lean_ex(name, team, opp, line):
     return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
             f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
             f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
-            f"{red_line}{gk_line}{h2h_line}{last5_line}{sub_line}", direction, "")
+            f"{red_line}{gk_line}{h2h_line}{last5_line}{market_line}{sub_line}", direction, "")
 
 
 # ===== SHOTS / TACKLES (v16) =====
@@ -994,11 +1042,24 @@ def sweep(cur, already, silent=False):
             except Exception as e:
                 print("recap tracking failed:", e)
         print(f"Sweep (silent restart catch-up): {len(juicy_items)} juicy picks re-learned, not reposted")
+        # v18: ONE compact digest instead of silence, so a pick that is NEW after the restart is never lost (repeats are listed too, in a single message)
+        try:
+            rows_txt = []
+            for it in sorted(juicy_items, key=lambda i: (_start_dt(i) or datetime.now(timezone.utc))):
+                st_dt = _start_dt(it)
+                when = _local(st_dt).strftime("%I:%M %p").lstrip("0") if st_dt else ""
+                rows_txt.append(f"{'🔥' if it['juicy'] == 'OVER' else '🧊'} {it['juicy']} — {it['name']} — "
+                                f"{STAT_LABEL.get(it.get('stat', 'passes'), 'Passes')} {float(it['line']):g} ({it.get('game_name', '')}{', ' + when if when else ''})")
+            if rows_txt:
+                head = f"🔁 Restart catch-up: {len(rows_txt)} juicy pick(s) on the board right now (some may repeat earlier posts):\n"
+                _post({"content": (head + "\n".join(rows_txt))[:1900]}, JUICY_WEBHOOK_URL or None)
+        except Exception as e:
+            print("catch-up digest failed:", e)
     elif juicy_items:
         send_grouped_embeds(juicy_items)
     print(f"Sweep: {len(rows)} lines in window, checked {checked}, with data {with_data}, juicy {len(juicy_items)}")
     if SWEEP_SUMMARY and WEBHOOK_URL:
-        msg = (f"🔎 Board sweep{' (restart catch-up, juicy picks not reposted)' if silent else ''}: {len(rows)} lines in the next {SWEEP_HOURS_AHEAD:g}h • checked {checked} • "
+        msg = (f"🔎 Board sweep{' (restart catch-up: juicy picks listed in one digest, not reposted one by one)' if silent else ''}: {len(rows)} lines in the next {SWEEP_HOURS_AHEAD:g}h • checked {checked} • "
                f"matchup data for {with_data} • juicy: {len(juicy_items)} "
                f"(🔥 {sum(1 for i in juicy_items if i['juicy'] == 'OVER')} over, "
                f"🧊 {sum(1 for i in juicy_items if i['juicy'] == 'UNDER')} under)")
@@ -1236,6 +1297,59 @@ def _post_recap(date_label, members):
     print(f"Recap posted for {date_label}: {w}-{l}-{v}, running record {_rec['w']}-{_rec['l']}-{_rec['v']}")
 
 
+# ===== LINEUP ALERT (v18) =====
+# About an hour before kickoff the starting lineups come out. For every juicy pick still open, the bot checks whether the player is in the
+# starting eleven and posts a warning if he is on the bench or not in the squad (a player who does not play = void; a sub gets few passes).
+LINEUP_ALERT = os.getenv("LINEUP_ALERT", "true").lower() == "true"
+LINEUP_BEFORE_MIN = int(os.getenv("LINEUP_BEFORE_MINUTES", "80"))        # start checking this long before kickoff
+LINEUP_EVERY_MIN = int(os.getenv("LINEUP_CHECK_MINUTES", "10"))
+_lineups = {}                                                            # fixture id -> lineups (kept once published)
+_lu = {"next": 0.0}
+
+
+def lineup_watch():
+    if not (LINEUP_ALERT and RECAP and _ledger and WEBHOOK_URL) or CAP - calls_used() < RECAP_KEEP:
+        return
+    now = _utcnow()
+    for e in list(_ledger.values()):
+        if e["state"] != "OPEN" or e.get("lu") or e["pid"] is None or e["tid"] is None:
+            continue
+        mins_to_ko = (e["start"] - now).total_seconds() / 60
+        if mins_to_ko > LINEUP_BEFORE_MIN or mins_to_ko < -5:
+            continue
+        try:
+            f = _fixture_for(e)
+            if not f:
+                continue
+            fid = f["fixture"]["id"]
+            lu = _lineups.get(fid)
+            if lu is None:
+                res = _get("/fixtures/lineups", {"fixture": fid})
+                if not res:
+                    continue                                              # lineups not out yet: try again in a few minutes
+                _lineups[fid] = lu = res
+            status = "absent"
+            for tb in lu:
+                if any((x.get("player") or {}).get("id") == e["pid"] for x in tb.get("startXI") or []):
+                    status = "start"
+                elif any((x.get("player") or {}).get("id") == e["pid"] for x in tb.get("substitutes") or []):
+                    status = "bench" if status != "start" else status
+            e["lu"] = status
+            if status == "start":
+                print("lineup: started:", e["name"])
+                continue
+            where = "on the BENCH" if status == "bench" else "NOT in the matchday squad"
+            msg = (f"⚠️ **Lineup alert** — **{e['name']}** is {where} for {e['game']}.\n"
+                   f"Captain Hook's pick: {e['dir']} {e['lines'][0]:g} {STAT_LABEL.get(e.get('stat', 'passes'), 'passes').lower()}. "
+                   f"{'If he does not play at all it is a void; as a sub his numbers will be low.' if status == 'bench' else 'He will not play: this pick is a void.'}")
+            _post({"content": msg}, JUICY_WEBHOOK_URL or None)
+            print("lineup alert:", e["name"], status)
+        except Exception as ex:
+            print("lineup check failed:", e["name"], ex)
+            if "cap" in str(ex) or "429" in str(ex):
+                break
+
+
 def settle_and_recap():
     if not RECAP or not _ledger or not WEBHOOK_URL:
         return
@@ -1351,6 +1465,12 @@ def main():
                 except Exception as e:
                     _warm["left"] = max(0, _warm["left"] - 1)
                     print(f"Sweep failed: {e}")
+            if LINEUP_ALERT and time.time() >= _lu["next"]:
+                _lu["next"] = time.time() + LINEUP_EVERY_MIN * 60
+                try:
+                    lineup_watch()
+                except Exception as e:
+                    print(f"Lineup watch failed: {e}")
             if RECAP and time.time() >= _recap["next"]:
                 _recap["next"] = time.time() + RECAP_EVERY_MIN * 60
                 try:
