@@ -1,6 +1,6 @@
-# Captain Hook v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
-import requests, time, os, unicodedata, re, math
+import requests, time, os, unicodedata, re, math, difflib
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -35,6 +35,7 @@ PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: shar
 STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
 DOM_HOLD = float(os.getenv("DOM_HOLD", "0"))      # v19: OFF by default (picks still post, with a warning). Set e.g. 1.30 to hold back picks against a much bigger possession side
 DOM_WARN = float(os.getenv("DOM_WARN", "1.15"))   # v19: ... from this ratio, a warning on the pick
+BENCH_MIN = float(os.getenv("BENCH_MIN", "60"))   # v20: a player averaging fewer minutes than this is treated as a bench/rotation player
 MARKET_WARN = float(os.getenv("MARKET_WARN", "0.20"))   # v18: a lean that fights the line by this share of his season average gets a warning (0 = off)
 MARKET_SKIP = float(os.getenv("MARKET_SKIP", "0.30"))   # v18: ... and by this much it is not tagged juicy at all (0 = off)
 CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
@@ -49,7 +50,8 @@ LEAGUE_CHECK = os.getenv(
     "LEAGUE_CHECK",
     "England:Premier League,Spain:La Liga,Italy:Serie A,Germany:Bundesliga,France:Ligue 1,"
     "Brazil:Serie A,USA:Major League Soccer,Netherlands:Eredivisie,Portugal:Primeira Liga,"
-    "World:UEFA Champions League,World:UEFA Nations League,World:World Cup - Qualification Europe")
+    "World:UEFA Champions League,World:UEFA Europa League,World:UEFA Europa Conference League,World:CONMEBOL Libertadores,"
+    "World:UEFA Nations League,World:World Cup - Qualification Europe,Saudi-Arabia:Pro League")
 BASE = "https://v3.football.api-sports.io"
 
 _cache = {}
@@ -168,7 +170,18 @@ ALIASES = {"turkiye": "Turkey", "türkiye": "Turkey", "bosnia and herzegovina": 
            "bremen": "Werder Bremen", "mainz": "Mainz 05", "verona": "Hellas Verona", "porto": "FC Porto", "lens": "Lens",
            "nice": "Nice", "lille": "Lille", "lyon": "Lyon", "monaco": "Monaco", "marseille": "Marseille", "newcastle": "Newcastle",
            "brighton": "Brighton", "leeds": "Leeds", "fenerbahce": "Fenerbahce", "besiktas": "Besiktas", "galatasaray": "Galatasaray",
-           "man u": "Manchester United", "man. united": "Manchester United", "man. city": "Manchester City"}   # PrizePicks vs API-Football spellings (extend as needed)
+           "man u": "Manchester United", "man. united": "Manchester United", "man. city": "Manchester City",
+           # v20: MLS short names PrizePicks uses ("Portland" also finds the women's Portland Thorns; "LAFC" finds nothing)
+           "galaxy": "LA Galaxy", "la galaxy": "LA Galaxy", "lafc": "Los Angeles FC", "portland": "Portland Timbers", "timbers": "Portland Timbers",
+           "sounders": "Seattle Sounders", "seattle": "Seattle Sounders", "austin": "Austin FC", "dallas": "FC Dallas", "colorado": "Colorado Rapids",
+           "minnesota": "Minnesota United", "earthquakes": "San Jose Earthquakes", "san jose": "San Jose Earthquakes", "salt lake": "Real Salt Lake",
+           "rsl": "Real Salt Lake", "inter miami": "Inter Miami", "miami": "Inter Miami", "atlanta": "Atlanta United", "charlotte": "Charlotte",
+           "chicago": "Chicago Fire", "cincinnati": "FC Cincinnati", "columbus": "Columbus Crew", "d c united": "DC United", "dc united": "DC United",
+           "houston": "Houston Dynamo", "kansas city": "Sporting Kansas City", "sporting kc": "Sporting Kansas City", "skc": "Sporting Kansas City",
+           "montreal": "CF Montreal", "nashville": "Nashville SC", "new england": "New England Revolution", "nycfc": "New York City FC",
+           "new york city": "New York City FC", "red bulls": "New York Red Bulls", "ny red bulls": "New York Red Bulls", "orlando": "Orlando City",
+           "philadelphia": "Philadelphia Union", "toronto": "Toronto FC", "vancouver": "Vancouver Whitecaps", "san diego": "San Diego FC",
+           "st louis": "St Louis City", "st. louis": "St Louis City"}   # PrizePicks vs API-Football spellings (extend as needed)
 
 
 _TRANSLIT = str.maketrans({"Đ": "Dj", "đ": "dj", "Ł": "L", "ł": "l", "Ø": "O", "ø": "o", "Æ": "Ae", "æ": "ae", "Œ": "Oe", "œ": "oe",
@@ -257,7 +270,7 @@ def _pick_by_team(cands, team, n=4):
     return None
 
 
-def _scan(cands, first, last, one_name):
+def _scan(cands, first, last, one_name, full=""):
     """Sort API profile candidates into: first name really matches, only the initial matches, or one-name hits."""
     exact, initial_only, singles = [], [], []
     for p in cands:
@@ -268,6 +281,9 @@ def _scan(cands, first, last, one_name):
         ln_tail = ln.split()[-1] if ln else ""    # "De Bruyne" -> "bruyne", "van Dijk" -> "dijk"
         ln_head = ln.split()[0] if ln else ""     # "Saldivia Vazquez" -> "saldivia" (Spanish double surnames)
         nm_tail = nm.split()[-1] if nm else ""
+        if full and not one_name and nm == full:
+            exact.append(pl)                      # v20: the API's display name is exactly PrizePicks' name ("Carlos Miguel", whose surname is dos Santos Pereira)
+            continue
         if one_name:
             if last in (fn, ln, nm):              # Rodri, Pedri, most Brazilians
                 singles.append(pl)
@@ -299,7 +315,7 @@ def _player(name, team=""):
     if len(q) < 4:
         return None                               # one short name (3 letters): the API can't search it
     cands = _get("/players/profiles", {"search": q})
-    exact, initial_only, singles = _scan(cands, first, last, one_name)
+    exact, initial_only, singles = _scan(cands, first, last, one_name, " ".join(parts).lower())
     if not one_name and not exact and not initial_only and len(last) < 4 and len(first) >= 4:
         # v14: short surname ("van de Ven" -> "ven"): the API can't search it, so search the FIRST name and let the surname filter pick him
         try:
@@ -310,7 +326,7 @@ def _player(name, team=""):
             more = []
         if more:
             cands = cands + more
-            exact, initial_only, singles = _scan(cands, first, last, one_name)
+            exact, initial_only, singles = _scan(cands, first, last, one_name, " ".join(parts).lower())
     if not one_name and not exact and len(parts) >= 2:
         # common surnames (Santos, Silva, Souza) fill the first page with the wrong people: try the full name once
         try:
@@ -321,7 +337,7 @@ def _player(name, team=""):
             more = []                             # API rejected this search style: keep the first result as is
         if more:
             cands = cands + more
-            exact, initial_only, singles = _scan(cands, first, last, one_name)
+            exact, initial_only, singles = _scan(cands, first, last, one_name, " ".join(parts).lower())
     chosen = None
     pool = singles if one_name else exact
     if len(pool) > 1 and team:                    # same name, different players: the club decides
@@ -330,6 +346,8 @@ def _player(name, team=""):
         chosen = pool[0]
     elif not one_name and len(initial_only) == 1:   # accept an initial-only match only if there is exactly one
         chosen = initial_only[0]
+    elif not one_name and len(initial_only) > 1 and team:   # v20: several possible players: the club decides
+        chosen = _pick_by_team(initial_only, team, 8)
 
     if not chosen and one_name and initial_only and team:   # v13: one-name player whose API name is longer ("Rayan" = "Rayan Vitor"): accept ONLY if his club matches
         chosen = _pick_by_team(initial_only, team, 15)   # v15: 8 -> 15 (common names like Natan have many namesakes)
@@ -635,6 +653,20 @@ def lean_ex(name, team, opp, line):
                           f" → over {line} in {gk_over}/{len(gkv)}")
 
     gap = proj - line
+    bench_line = ""
+    avg_m = risk.get("avg_min") or 90
+    if not is_gk and risk.get("apps", 0) >= SUB_MIN_APPS and avg_m < BENCH_MIN:
+        # v20: a bench / rotation player (Boudache: avg 36 min). Per-90 numbers assume a full game. An OVER is judged on his usual
+        # minutes; an UNDER on a full game (PrizePicks posts the line expecting him to start). In between: no edge.
+        proj_lo = proj * avg_m / 90.0
+        if proj_lo > line:
+            gap, proj = proj_lo - line, proj_lo
+        elif proj < line:
+            gap = proj - line
+        else:
+            gap = 0.0
+        bench_line = (f"\n   🪑 Usually plays {avg_m:.0f} min: over judged on {avg_m:.0f} min, under on a full game. "
+                      f"Check the lineup: if he starts, the over is live; if he is on the bench, it is not.")
     juicy = abs(gap) >= max(EDGE_PCT * line, MIN_EDGE)
     if juicy:
         tag = "🔥 JUICY — lean OVER" if gap > 0 else "🧊 JUICY — lean UNDER"
@@ -706,7 +738,8 @@ def lean_ex(name, team, opp, line):
     if juicy and not is_gk and risk["apps"] >= SUB_MIN_APPS:
         rate = risk["sub_out"] / risk["apps"]
         if rate >= SUB_RATE or risk["avg_min"] < SUB_AVG_MIN:
-            facts = f"subbed off in {risk['sub_out']} of {risk['apps']} apps, avg {risk['avg_min']:.0f} min"
+            facts = (f"subbed off in {risk['sub_out']} of {risk['apps']} apps, avg {risk['avg_min']:.0f} min"
+                     if rate >= SUB_RATE else f"often comes off the bench, avg {risk['avg_min']:.0f} min")
             if gap > 0 and SUB_FADE_OVERS:
                 _suppressed["n"] += 1                       # v13: fade it. An over on a player who gets subbed off early is not worth it
                 return "", False, ""
@@ -716,7 +749,7 @@ def lean_ex(name, team, opp, line):
     return (f"\n   📊 Proj **{proj:.1f}** vs line {line} → {tag}"
             f"\n   • Avg {per90:.1f}/90 × {factor:.2f} matchup "
             f"(opp allows {opp_allowed:.0f}, their team makes {team_made:.0f})"
-            f"{red_line}{gk_line}{h2h_line}{last5_line}{market_line}{dom_line}{sub_line}", direction, "")
+            f"{red_line}{gk_line}{h2h_line}{last5_line}{market_line}{dom_line}{bench_line}{sub_line}", direction, "")
 
 
 # ===== SHOTS / TACKLES (v16) =====
@@ -855,8 +888,82 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
     return note, ("OVER" if lean_over else "UNDER"), ""
 
 
+# ===== TEAMS FROM THE FIXTURE (v20) =====
+# A name search guesses: "Estudiantes", "Salzburg", "R. Union SG", "Hazem", "Portland" can each be several clubs (or none).
+# The match itself settles it: one call lists every fixture on that date, and the game whose two sides match BOTH PrizePicks
+# names gives the right club ids for both teams. If no single game matches, the bot falls back to the old name search.
+PAIR_LOOKUP = os.getenv("PAIR_LOOKUP", "true").lower() == "true"
+_GENERIC = {"real", "united", "city", "club", "fc", "cf", "sc", "ac", "as", "the", "de", "del", "la", "le", "al", "el", "sv", "fk", "sk"}
+
+
+def _toks(s):
+    return [w for w in _clean(s).lower().split() if len(w) >= 3 and w not in _GENERIC]
+
+
+def _name_match(pp, api):
+    names = [pp]
+    al = ALIASES.get((pp or "").lower()) or ALIASES.get(_clean(pp).lower())
+    if al:
+        names.append(al)
+    ta = _toks(api)
+    for n in names:
+        if _clean(n).lower() == _clean(api).lower():
+            return True
+        for x in _toks(n):
+            for y in ta:
+                if x == y or (len(x) >= 4 and len(y) >= 4 and (x in y or y in x
+                                                            or difflib.SequenceMatcher(None, x, y).ratio() >= 0.8)):
+                    return True                    # "hazem" ~ "hazm", "salzburg" in "red bull salzburg"
+    return False
+
+
+def _pair_ids(team, opp, date):
+    fx = _cached(("day", date), lambda: _get("/fixtures", {"date": date})) or []
+    hits = []
+    want_youth = bool(_YOUTH.search(_clean(team).lower()) or _YOUTH.search(_clean(opp).lower()))
+    for f in fx:
+        h, a = f["teams"]["home"], f["teams"]["away"]
+        if not want_youth and (_YOUTH.search(_clean(h["name"]).lower()) or _YOUTH.search(_clean(a["name"]).lower())):
+            continue                               # skip the women's / youth version of the same derby (Sydney FC W v Western Sydney Wanderers W)
+        if _name_match(team, h["name"]) and _name_match(opp, a["name"]):
+            hits.append((h["id"], a["id"]))
+        elif _name_match(team, a["name"]) and _name_match(opp, h["name"]):
+            hits.append((a["id"], h["id"]))
+    hits = list(dict.fromkeys(hits))
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        print("fixture lookup: more than one game matches", team, "v", opp, date, hits)
+    return None
+
+
+def _seed_teams(info):
+    """v20: put the fixture's club ids in the team memory, so every lookup (and the recap) uses the right clubs."""
+    if not (PAIR_LOOKUP and MATCHUP and KEY):
+        return
+    team, opp, st = info.get("team"), info.get("opp"), _start_dt(info)
+    if not (team and opp and st):
+        return
+    date = st.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    ids = _cached(("pair", team, opp, date), lambda: _pair_ids(team, opp, date))
+    if not ids:
+        return
+    exp = time.time() + CACHE_HOURS * 3600
+    for nm, tid in ((team, ids[0]), (opp, ids[1])):
+        cur = _cache.get(("team", nm))
+        if not cur or cur[1] != tid:
+            if cur and cur[1]:
+                print("fixture lookup: corrected", nm, cur[1], "->", tid)
+            _cache[("team", nm)] = (exp, tid)
+            _last_err.pop(("team", nm), None)
+
+
 def lean_for(info):
     """One entry point for every kind of line."""
+    try:
+        _seed_teams(info)
+    except Exception as e:
+        print("fixture lookup failed:", e)
     stat = info.get("stat", "passes")
     if stat == "passes":
         note, juicy, why = lean_ex(info["name"], info["team"], info["opp"], float(info["line"]))
