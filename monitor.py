@@ -1,4 +1,4 @@
-# Captain Hook v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v22 = v21 + Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math, difflib
 from datetime import datetime, timezone, timedelta
@@ -33,7 +33,7 @@ PROP_PROB = float(os.getenv("PROP_PROB", "0.70"))                    # v16: chan
 PROP_MIN_MIN = float(os.getenv("PROP_MIN_MINUTES", "450"))           # v16: needs this many season minutes of data (about 5 full games)
 PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: share of his last games that must be on the lean side
 STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
-DOM_HOLD = float(os.getenv("DOM_HOLD", "0"))      # v19: OFF by default (picks still post, with a warning). Set e.g. 1.30 to hold back picks against a much bigger possession side
+DOM_HOLD = float(os.getenv("DOM_HOLD", "1.30"))   # v22: from this possession ratio the pick is NOT juicy; the post says the mismatch points the other way (Ipswich v Man City). 0 = off
 DOM_WARN = float(os.getenv("DOM_WARN", "1.15"))   # v19: ... from this ratio, a warning on the pick
 BENCH_MIN = float(os.getenv("BENCH_MIN", "60"))   # v20: a player averaging fewer minutes than this is treated as a bench/rotation player
 MARKET_WARN = float(os.getenv("MARKET_WARN", "0.20"))   # v18: a lean that fights the line by this share of his season average gets a warning (0 = off)
@@ -301,7 +301,33 @@ def _scan(cands, first, last, one_name, full=""):
     return exact, initial_only, singles
 
 
-def _player(name, team=""):
+def _squad_pick(tid, parts, first, last, one_name):
+    """v21: search inside his club's squad (team + season + name). 'Lopez' alone returns 250+ players worldwide and the right one
+    may not be among them; inside Barcelona's squad there is one. The same call returns his season stats, so they are kept."""
+    full = " ".join(parts).lower()
+    for tq in dict.fromkeys(w for w in (last, first) if len(w) >= 4):
+        try:
+            squad = [it for it in (_get("/players", {"team": tid, "season": SEASON, "search": tq}) or [])
+                     if isinstance(it, dict) and it.get("player")]
+        except RuntimeError as e:
+            if "cap" in str(e) or "429" in str(e) or "season locked" in str(e):
+                raise
+            squad = []
+        if not squad:
+            continue
+        ex, io, sg = _scan(squad, first, last, one_name, full)
+        pool = (sg + io) if one_name else (ex or io)
+        if pool:
+            pl = pool[0]
+            item = next((it for it in squad if (it.get("player") or {}).get("id") == pl.get("id")), None)
+            if item and item.get("statistics"):
+                _cache[("pdata", pl["id"])] = (time.time() + CACHE_HOURS * 3600, [item])
+            print("player matched in club squad:", " ".join(parts), "->", pl.get("firstname"), pl.get("lastname"), "id", pl.get("id"))
+            return pl
+    return None
+
+
+def _player(name, team="", tid=None):
     if _season_locked():
         raise RuntimeError("free plan: season locked")      # don't spend a call on a lookup that will be blocked
     parts = _clean(name).split()
@@ -314,9 +340,10 @@ def _player(name, team=""):
         q = " ".join(parts[-2:]) if len(parts) >= 2 else ""
     if len(q) < 4:
         return None                               # one short name (3 letters): the API can't search it
-    cands = _get("/players/profiles", {"search": q})
+    forced = _squad_pick(tid, parts, first, last, one_name) if tid else None
+    cands = [] if forced else _get("/players/profiles", {"search": q})
     exact, initial_only, singles = _scan(cands, first, last, one_name, " ".join(parts).lower())
-    if not one_name and not exact and not initial_only and len(last) < 4 and len(first) >= 4:
+    if not forced and not one_name and not exact and not initial_only and len(last) < 4 and len(first) >= 4:
         # v14: short surname ("van de Ven" -> "ven"): the API can't search it, so search the FIRST name and let the surname filter pick him
         try:
             more = _get("/players/profiles", {"search": first})
@@ -327,7 +354,7 @@ def _player(name, team=""):
         if more:
             cands = cands + more
             exact, initial_only, singles = _scan(cands, first, last, one_name, " ".join(parts).lower())
-    if not one_name and not exact and len(parts) >= 2:
+    if not forced and not one_name and not exact and len(parts) >= 2:
         # common surnames (Santos, Silva, Souza) fill the first page with the wrong people: try the full name once
         try:
             more = _get("/players/profiles", {"search": " ".join(parts)})
@@ -349,6 +376,8 @@ def _player(name, team=""):
     elif not one_name and len(initial_only) > 1 and team:   # v20: several possible players: the club decides
         chosen = _pick_by_team(initial_only, team, 8)
 
+    if forced:
+        chosen = forced
     if not chosen and one_name and initial_only and team:   # v13: one-name player whose API name is longer ("Rayan" = "Rayan Vitor"): accept ONLY if his club matches
         chosen = _pick_by_team(initial_only, team, 15)   # v15: 8 -> 15 (common names like Natan have many namesakes)
     if not chosen:
@@ -398,6 +427,16 @@ def _passes(stat_block):
     return None
 
 
+def _fouls(stat_block):
+    for s in stat_block["statistics"]:
+        if s["type"] == "Fouls":
+            try:
+                return int(s["value"] or 0)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _shots(stat_block):
     for s in stat_block["statistics"]:
         if s["type"] == "Total Shots":
@@ -439,20 +478,27 @@ def _form(tid):
             red = any(_red(b) > 0 for b in blocks)
             ms = [_shots(b) for b in blocks if b["team"]["id"] == tid]
             ts = [_shots(b) for b in blocks if b["team"]["id"] != tid]
+            mf = [_fouls(b) for b in blocks if b["team"]["id"] == tid]
+            tfo = [_fouls(b) for b in blocks if b["team"]["id"] != tid]
             rows.append((f["fixture"]["id"], mine[0], theirs[0], red,
-                         ms[0] if ms else None, ts[0] if ts else None))     # v16: team shots come with the same stats (no extra calls)
+                         ms[0] if ms else None, ts[0] if ts else None,     # v16: team shots come with the same stats (no extra calls)
+                         mf[0] if mf else None, tfo[0] if tfo else None))  # v22: team fouls committed / fouls suffered (no extra calls)
         else:
             nostats += 1
     clean = [r for r in rows if not r[3]]
     use = clean if len(clean) >= 3 else rows        # not enough clean games: fall back to all of them
     if len(use) < 3:
         raise DataGap(f"{len(use)} usable/{len(fx)} listed, {final} final, {nostats} no pass stats")
+    fom = [r[6] for r in use if r[6] is not None]
+    fod = [r[7] for r in use if r[7] is not None]
     shm = [r[4] for r in use if r[4] is not None]
     sha = [r[5] for r in use if r[5] is not None]
     return {"made": sum(r[1] for r in use) / len(use),
             "allowed": sum(r[2] for r in use) / len(use),
             "sh_made": (sum(shm) / len(shm)) if len(shm) >= 3 else None,         # v16: team shots made / allowed per game
             "sh_allowed": (sum(sha) / len(sha)) if len(sha) >= 3 else None,
+            "fo_made": (sum(fom) / len(fom)) if len(fom) >= 3 else None,       # v22: fouls his team commits per game
+            "fo_drawn": (sum(fod) / len(fod)) if len(fod) >= 3 else None,      # v22: fouls opponents commit against his team
             "fids": [r[0] for r in use],
             "red_out": len(rows) - len(use),        # red-card games left out
             "red_in": any(r[3] for r in use)}       # red-card games still counted (too few clean games)
@@ -616,7 +662,7 @@ def lean_ex(name, team, opp, line):
     of = _cached(fk2, lambda: _form(oid))
     if not (tf and of):
         return "", False, "recent games: " + _why(fk1, fk2)
-    p = _cached(pk, lambda: _player(name, team))
+    p = _cached(pk, lambda: _player(name, team, tid))
     if not p:
         return "", False, "player: " + _why(pk)
     pid, per90, risk = p
@@ -720,15 +766,21 @@ def lean_ex(name, team, opp, line):
                            f"PrizePicks may expect a {'quieter' if gap > 0 else 'bigger'} game than usual (one team dominating the ball?).")
 
     dom_line = ""
-    if juicy and not is_gk and tf.get("made") and of.get("made"):
+    if juicy and tf.get("made") and of.get("made"):
         # v19: possession mismatch. The matchup factor averages the two teams, so a small club facing a giant (LASK v Liverpool,
         # Galatasaray v Barcelona) looks "normal". Compare how many passes each side usually makes: if the opponent makes far more,
         # his team will chase the ball -> no juicy OVER. Mirror: his team makes far more -> no juicy UNDER (Bayern v Viking).
-        ratio = of["made"] / tf["made"] if gap > 0 else tf["made"] / of["made"]
+        # v22: keepers too: in a lopsided game BOTH keepers get few passes (the dominant side's keeper gets no back-passes, the other one kicks long) -> no juicy keeper OVER.
+        if is_gk:
+            ratio = max(tf["made"] / of["made"], of["made"] / tf["made"]) if gap > 0 else 0.0   # either keeper: a lopsided game starves both
+        else:
+            ratio = of["made"] / tf["made"] if gap > 0 else tf["made"] / of["made"]
         if DOM_HOLD and ratio >= DOM_HOLD:
             _suppressed["n"] += 1
-            return "", False, ""
-        if DOM_WARN and ratio >= DOM_WARN:
+            other = "UNDER" if gap > 0 else "OVER"
+            return (f"\n   📊 Proj {proj:.1f} vs line {line} → ⚪ held back: possession mismatch ({ratio:.2f}×, "
+                    f"{tf['made']:.0f} vs {of['made']:.0f} passes a game). Risky either way: skip it, or if you play it, the mismatch points to the {other}.", False, "")
+        if DOM_WARN and ratio >= DOM_WARN and not is_gk:
             risky = "🚨 RISKY" if ratio >= 1.30 else "⚠️ Risk"
             dom_line = (f"\n   {risky}: possession mismatch, {'the opponent' if gap > 0 else 'his team'} usually makes {ratio:.2f}× the passes "
                         f"({(of if gap > 0 else tf)['made']:.0f} vs {(tf if gap > 0 else of)['made']:.0f}). "
@@ -815,7 +867,7 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
     of = _cached(fk2, lambda: _form(oid))
     if not (tf and of):
         return "", False, "recent games: " + _why(fk1, fk2)
-    p = _cached(pk, lambda: _player(name, team))
+    p = _cached(pk, lambda: _player(name, team, tid))
     if not p:
         return "", False, "player: " + _why(pk)
     pid, _p90, risk = p
@@ -877,6 +929,9 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
                 return "", False, ""
             sub_line = (f"\n   ⚠️ Sub risk: subbed off in {risk['sub_out']} of {risk['apps']} apps, "
                         f"avg {risk['avg_min']:.0f} min. {STAT_LABEL[stat]} can fall short.")
+    if lean_over and dom > 0 and DOM_HOLD and 1 / dom >= DOM_HOLD:
+        _suppressed["n"] += 1
+        return "", False, ""                                   # v22: his team will barely have the ball: no juicy shots OVER
     dom_txt = ""
     if lean_over and dom > 0 and 1 / dom >= 1.15:
         dom_txt = (f"\n   {'🚨 RISKY' if 1 / dom >= 1.30 else '⚠️ Risk'}: possession mismatch, the opponent usually makes "
@@ -1474,6 +1529,136 @@ def _post_recap(date_label, members):
     print(f"Recap posted for {date_label}: {w}-{l}-{v}, running record {_rec['w']}-{_rec['l']}-{_rec['v']}")
 
 
+# ===== PICK6 FOULS GUIDE (v22) =====
+# Pick6 (DraftKings) is a different app: the bot cannot see its lines. So for each game it posts the players most likely to DRAW and to
+# COMMIT fouls, with a projected number and the last games. Compare with the Pick6 line yourself: line well below the number = over,
+# well above = under. Uses data the bot already has for passes/shots (no extra calls). Off unless PICK6_WEBHOOK_URL is set.
+PICK6_WEBHOOK_URL = os.getenv("PICK6_WEBHOOK_URL")
+PICK6_HOURS_BEFORE = float(os.getenv("PICK6_HOURS_BEFORE", "30"))    # post as EARLY as possible (up to 30h ahead): mispriced Pick6 lines get pulled fast
+PICK6_TOP = int(os.getenv("PICK6_TOP", "3"))                         # players per list
+PICK6_MIN_MIN = float(os.getenv("PICK6_MIN_MINUTES", "450"))
+PICK6_MIN_PLAYERS = int(os.getenv("PICK6_MIN_PLAYERS", "4"))       # wait until at least this many players of the game have data
+PICK6_PAIR_MIN = float(os.getenv("PICK6_PAIR_MIN", "1.3"))           # both players' projections must be at least this to be paired
+_p6 = {"next": 0.0, "done": set()}
+
+
+def _cached_val(key):
+    hit = _cache.get(key)
+    return hit[1] if hit and time.time() < hit[0] else None
+
+
+def _foul_rates(pid):
+    data = _cached_val(("pdata", pid))
+    drawn = comm = mins = apps = 0
+    for st in ((data or [{}])[0].get("statistics") or []):
+        fo = st.get("fouls") or {}
+        if fo.get("drawn") is None and fo.get("committed") is None:
+            continue
+        drawn += fo.get("drawn") or 0
+        comm += fo.get("committed") or 0
+        mins += (st.get("games") or {}).get("minutes") or 0
+        apps += (st.get("games") or {}).get("appearences") or 0
+    return drawn, comm, mins, apps
+
+
+def _foul_last(pid, fids):
+    out = []
+    for fid in fids or []:
+        blocks = _cached_val(("fxp", fid))
+        for tb in blocks or []:
+            for pl in tb.get("players", []):
+                if (pl.get("player") or {}).get("id") == pid:
+                    st = (pl.get("statistics") or [{}])[0]
+                    if ((st.get("games") or {}).get("minutes") or 0) >= 45:
+                        fo = st.get("fouls") or {}
+                        out.append((fo.get("drawn") or 0, fo.get("committed") or 0))
+    return out
+
+
+def pick6_watch(cur):
+    if not (PICK6_WEBHOOK_URL and MATCHUP and cur):
+        return
+    now = datetime.now(timezone.utc)
+    games = defaultdict(list)
+    for info in cur.values():
+        st = _start_dt(info)
+        if not st or info.get("game_id") in _p6["done"]:
+            continue
+        if 0 < (st - now).total_seconds() <= PICK6_HOURS_BEFORE * 3600:
+            games[info.get("game_id")].append(info)
+    for gid, infos in games.items():
+        seen_p, drawn_rows, comm_rows = set(), [], []
+        for info in infos:
+            key = (info["name"], info.get("team", ""))
+            if key in seen_p:
+                continue
+            seen_p.add(key)
+            p = _cached_val(("player", info["name"], info.get("team", "")))
+            tid = _cached_val(("team", info.get("team", "")))
+            oid = _cached_val(("team", info.get("opp", "")))
+            if not (p and tid and oid):
+                continue
+            tf, of = _cached_val(("form", tid)), _cached_val(("form", oid))
+            if not (tf and of):
+                continue
+            pid, _p90, risk = p
+            if (risk.get("pos") or "").lower() == "goalkeeper":
+                continue
+            d, c, mins, apps = _foul_rates(pid)
+            if mins < PICK6_MIN_MIN:
+                continue
+            m_ = min(90.0, mins / apps) if apps else 80.0
+            fd = fc = 1.0
+            if tf.get("fo_drawn") and of.get("fo_made"):
+                fd = max(0.7, min(1.4, ((tf["fo_drawn"] + of["fo_made"]) / 2) / tf["fo_drawn"]))
+            if tf.get("fo_made") and of.get("fo_drawn"):
+                fc = max(0.7, min(1.4, ((tf["fo_made"] + of["fo_drawn"]) / 2) / tf["fo_made"]))
+            last = _foul_last(pid, tf.get("fids"))
+            base = dict(name=info["name"], team=info.get("team", ""), mins=m_, last=last, pos=(risk.get("pos") or ""))
+            drawn_rows.append(dict(base, proj=d / (mins / 90) * m_ / 90 * fd, p90=d / (mins / 90), f=fd, idx=0))
+            comm_rows.append(dict(base, proj=c / (mins / 90) * m_ / 90 * fc, p90=c / (mins / 90), f=fc, idx=1))
+        if len(drawn_rows) < PICK6_MIN_PLAYERS:
+            continue                                   # not enough of this game's players looked up yet: try again in 10 minutes
+        info0 = infos[0]
+        st = _start_dt(info0)
+        when = _local(st).strftime("%I:%M %p").lstrip("0") if st else ""
+
+        def fmt(r):
+            l5 = ", ".join(str(x[r["idx"]]) for x in r["last"][:5])
+            return (f"• **{r['name']}** ({r['team']}) — proj **{r['proj']:.1f}** · {r['p90']:.1f}/90 · ~{r['mins']:.0f} min"
+                    + (f" · matchup ×{r['f']:.2f}" if abs(r['f'] - 1) >= 0.05 else "") + (f" · last: {l5}" if l5 else ""))
+        top_d = sorted(drawn_rows, key=lambda r: -r["proj"])[:PICK6_TOP]
+        top_c = sorted(comm_rows, key=lambda r: -r["proj"])[:PICK6_TOP]
+        # v22: PAIRS. A player who draws a lot of fouls and an OPPONENT who commits a lot tend to move together (the more one is fouled,
+        # the more the other side fouls), so drawn-on-one-side + committed-on-the-other is a natural pair from the same game.
+        pairs = []
+        for side in {r["team"] for r in drawn_rows}:
+            ds = sorted([r for r in drawn_rows if r["team"] == side and r["pos"].lower() != "defender"] or
+                        [r for r in drawn_rows if r["team"] == side], key=lambda r: -r["proj"])
+            cs = sorted([r for r in comm_rows if r["team"] != side and r["pos"].lower() in ("defender", "midfielder")] or
+                        [r for r in comm_rows if r["team"] != side], key=lambda r: -r["proj"])
+            if ds and cs and ds[0]["proj"] >= PICK6_PAIR_MIN and cs[0]["proj"] >= PICK6_PAIR_MIN:
+                pairs.append((ds[0], cs[0]))
+        pairs.sort(key=lambda pc: -(pc[0]["proj"] + pc[1]["proj"]))
+        pair_txt = ""
+        if pairs:
+            pair_txt = "**🔗 Pair ideas (drawn on one side + committed on the other)**\n" + "\n".join(
+                f"• **{d['name']}** fouls DRAWN (proj {d['proj']:.1f}) + **{c['name']}** fouls COMMITTED (proj {c['proj']:.1f})"
+                for d, c in pairs[:2]) + "\n"
+        msg = (f"🟨 **Pick6 fouls guide — {info0.get('game_name', '')}**" + (f" ({when})" if when else "") + "\n"
+               + pair_txt
+               + "**Most likely to DRAW fouls**\n" + "\n".join(fmt(r) for r in top_d) + "\n"
+               + "**Most likely to COMMIT fouls**\n" + "\n".join(fmt(r) for r in top_c) + "\n"
+               + "_Guide only: compare with the Pick6 line (line well below proj = over, well above = under). Referee not included; check the lineup. "
+                 "Posted early, before lineups: check he starts. Pick6 sometimes pulls lines it mispriced, so lock pairs early._")
+        try:
+            _post({"username": "Captain Hook", "content": msg[:1990]}, PICK6_WEBHOOK_URL)
+            _p6["done"].add(gid)
+            print("pick6 guide posted:", info0.get("game_name"))
+        except Exception as e:
+            print("pick6 post failed:", e)
+
+
 # ===== LINEUP ALERT (v18) =====
 # About an hour before kickoff the starting lineups come out. For every juicy pick still open, the bot checks whether the player is in the
 # starting eleven and posts a warning if he is on the bench or not in the squad (a player who does not play = void; a sub gets few passes).
@@ -1642,6 +1827,12 @@ def main():
                 except Exception as e:
                     _warm["left"] = max(0, _warm["left"] - 1)
                     print(f"Sweep failed: {e}")
+            if PICK6_WEBHOOK_URL and time.time() >= _p6["next"]:
+                _p6["next"] = time.time() + 10 * 60
+                try:
+                    pick6_watch(cur)
+                except Exception as e:
+                    print(f"Pick6 guide failed: {e}")
             if LINEUP_ALERT and time.time() >= _lu["next"]:
                 _lu["next"] = time.time() + LINEUP_EVERY_MIN * 60
                 try:
