@@ -1538,7 +1538,9 @@ PICK6_HOURS_BEFORE = float(os.getenv("PICK6_HOURS_BEFORE", "30"))    # post as E
 PICK6_TOP = int(os.getenv("PICK6_TOP", "3"))                         # players per list
 PICK6_MIN_MIN = float(os.getenv("PICK6_MIN_MINUTES", "450"))
 PICK6_MIN_PLAYERS = int(os.getenv("PICK6_MIN_PLAYERS", "4"))       # wait until at least this many players of the game have data
-PICK6_PAIR_MIN = float(os.getenv("PICK6_PAIR_MIN", "1.3"))           # both players' projections must be at least this to be paired
+PICK6_PAIR_MIN = float(os.getenv("PICK6_PAIR_MIN", "1.3"))           # (older setting, kept so the variable still works)
+PICK6_LEG_PROB = float(os.getenv("PICK6_LEG_PROB", "0.62"))          # v22: each leg of a 2-pick play needs at least this chance at its line
+PICK6_MAX_PLAYS = int(os.getenv("PICK6_MAX_PLAYS", "2"))             # v22: at most this many plays per game
 _p6 = {"next": 0.0, "done": set()}
 
 
@@ -1623,38 +1625,58 @@ def pick6_watch(cur):
         st = _start_dt(info0)
         when = _local(st).strftime("%I:%M %p").lstrip("0") if st else ""
 
-        def fmt(r):
-            l5 = ", ".join(str(x[r["idx"]]) for x in r["last"][:5])
-            return (f"• **{r['name']}** ({r['team']}) — proj **{r['proj']:.1f}** · {r['p90']:.1f}/90 · ~{r['mins']:.0f} min"
-                    + (f" · matchup ×{r['f']:.2f}" if abs(r['f'] - 1) >= 0.05 else "") + (f" · last: {l5}" if l5 else ""))
-        top_d = sorted(drawn_rows, key=lambda r: -r["proj"])[:PICK6_TOP]
-        top_c = sorted(comm_rows, key=lambda r: -r["proj"])[:PICK6_TOP]
-        # v22: PAIRS. A player who draws a lot of fouls and an OPPONENT who commits a lot tend to move together (the more one is fouled,
-        # the more the other side fouls), so drawn-on-one-side + committed-on-the-other is a natural pair from the same game.
-        pairs = []
+        # v22: READY-MADE 2-PICK PLAYS. For each side of the game: the best fouls-DRAWN player on one team + the best fouls-COMMITTED
+        # player on the other (the two tend to move together). Each leg gets the highest line (0.5 / 1.5 / 2.5) it clears with at least
+        # PICK6_LEG_PROB chance. Only plays where BOTH legs clear it are posted; a game with no strong play posts nothing.
+        def best_line(r):
+            for L in (2.5, 1.5, 0.5):
+                pr = _p_over(L, r["proj"])
+                if pr >= PICK6_LEG_PROB:
+                    return L, pr
+            return None, 0.0
+
+        def ab(team):
+            w = [x for x in _clean(team).split() if x.lower() not in _STOP] or [team]
+            return (w[0][:3] if len(w) == 1 else "".join(x[0] for x in w[:3])).upper()
+
+        plays = []
         for side in {r["team"] for r in drawn_rows}:
-            ds = sorted([r for r in drawn_rows if r["team"] == side and r["pos"].lower() != "defender"] or
-                        [r for r in drawn_rows if r["team"] == side], key=lambda r: -r["proj"])
-            cs = sorted([r for r in comm_rows if r["team"] != side and r["pos"].lower() in ("defender", "midfielder")] or
-                        [r for r in comm_rows if r["team"] != side], key=lambda r: -r["proj"])
-            if ds and cs and ds[0]["proj"] >= PICK6_PAIR_MIN and cs[0]["proj"] >= PICK6_PAIR_MIN:
-                pairs.append((ds[0], cs[0]))
-        pairs.sort(key=lambda pc: -(pc[0]["proj"] + pc[1]["proj"]))
-        pair_txt = ""
-        if pairs:
-            pair_txt = "**🔗 Pair ideas (drawn on one side + committed on the other)**\n" + "\n".join(
-                f"• **{d['name']}** fouls DRAWN (proj {d['proj']:.1f}) + **{c['name']}** fouls COMMITTED (proj {c['proj']:.1f})"
-                for d, c in pairs[:2]) + "\n"
-        msg = (f"🟨 **Pick6 fouls guide — {info0.get('game_name', '')}**" + (f" ({when})" if when else "") + "\n"
-               + pair_txt
-               + "**Most likely to DRAW fouls**\n" + "\n".join(fmt(r) for r in top_d) + "\n"
-               + "**Most likely to COMMIT fouls**\n" + "\n".join(fmt(r) for r in top_c) + "\n"
-               + "_Guide only: compare with the Pick6 line (line well below proj = over, well above = under). Referee not included; check the lineup. "
-                 "Posted early, before lineups: check he starts. Pick6 sometimes pulls lines it mispriced, so lock pairs early._")
+            legs_d = [(r,) + best_line(r) for r in drawn_rows if r["team"] == side]
+            legs_c = [(r,) + best_line(r) for r in comm_rows if r["team"] != side]
+            legs_d = [x for x in legs_d if x[1] is not None]
+            legs_c = [x for x in legs_c if x[1] is not None]
+            if not (legs_d and legs_c):
+                continue
+            d = max(legs_d, key=lambda x: (x[1], x[2]))
+            c = max([x for x in legs_c if x[0]["name"] != d[0]["name"]] or legs_c, key=lambda x: (x[1], x[2]))
+            if d[0]["name"] == c[0]["name"]:
+                continue
+            plays.append((d, c))
+        plays.sort(key=lambda pc: -(pc[0][2] * pc[1][2]))
+        if not plays:
+            continue                                   # nothing strong in this game: post nothing (checked again later)
+
+        def leg(x, what):
+            r, L, pr = x
+            l5 = " ".join(str(v[r["idx"]]) for v in r["last"][:5])
+            return (f"**{r['name']}** ({ab(r['team'])}) — fouls {what} **OVER {L:g}**  ·  {pr * 100:.0f}%\n"
+                    f"proj {r['proj']:.1f}" + (f" · last {l5}" if l5 else ""))
+
+        fields = []
+        for i, (d, c) in enumerate(plays[:PICK6_MAX_PLAYS], 1):
+            fields.append({"name": f"🎯 Play {i}  ·  both hit ≈ {d[2] * c[2] * 100:.0f}%", "inline": False,
+                           "value": leg(d, "drawn") + "\n" + leg(c, "committed")})
+        embed = {
+            "title": f"🟨 Pick6 2-Pick — {info0.get('game_name', '')}",
+            "description": (f"⏰ {when}  ·  " if when else "") + "If Pick6's line is HIGHER than shown, skip that leg.",
+            "color": 16766720,
+            "fields": fields,
+            "footer": {"text": f"Fouls guide · before lineups (check they start) · referee not included · {INSTANCE}"},
+        }
         try:
-            _post({"username": "Captain Hook", "content": msg[:1990]}, PICK6_WEBHOOK_URL)
+            _post({"username": "Captain Hook", "embeds": [embed]}, PICK6_WEBHOOK_URL)
             _p6["done"].add(gid)
-            print("pick6 guide posted:", info0.get("game_name"))
+            print("pick6 plays posted:", info0.get("game_name"), len(plays))
         except Exception as e:
             print("pick6 post failed:", e)
 
