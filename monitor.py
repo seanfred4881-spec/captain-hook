@@ -1,4 +1,4 @@
-# Captain Hook v22 = v21 + Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v22 = v21 + shots picks OFF +  Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math, difflib
 from datetime import datetime, timezone, timedelta
@@ -23,7 +23,8 @@ SUB_RATE = float(os.getenv("SUB_RATE", "0.5"))        # flag if subbed off in at
 SUB_MIN_APPS = int(os.getenv("SUB_MIN_APPS", "4"))    # needs this many appearances to judge
 SUB_AVG_MIN = float(os.getenv("SUB_AVG_MIN", "70"))   # or if the average minutes per appearance is below this
 SUB_FADE_OVERS = os.getenv("SUB_FADE_OVERS", "false").lower() == "true"   # v13: an OVER with sub risk is NOT tagged juicy (an UNDER with sub risk still is, it supports the under)
-PROP_SHOTS = os.getenv("PROP_SHOTS", "true").lower() == "true"       # v16: shots lines (posted ONLY when juicy). false = ignore them
+PROP_SHOTS = os.getenv("PROP_SHOTS", "false").lower() == "true"      # v22: shots picks OFF (hit rate too low). true = turn them back on
+PICK6_WARM = os.getenv("PICK6_WARM", "true").lower() == "true"       # v22: still look up shots-line players (no picks) so the Pick6 fouls guide has attackers to work with
 PROP_TACKLES = os.getenv("PROP_TACKLES", "false").lower() == "true"   # v18: OFF by default (PrizePicks posts almost only demon tackles lines; not worth the calls). true = turn back on
 PROP_UNDERS = os.getenv("PROP_UNDERS", "false").lower() == "true"    # v17: shots/tackles UNDER picks. Default false: PrizePicks usually offers only More on these
 PROP_STD_UNDERS = os.getenv("PROP_STD_UNDERS", "true").lower() == "true"   # v17: an UNDER on shots/tackles is allowed ONLY on standard lines (those show Less AND More). Demon/goblin lines are More-only
@@ -1013,6 +1014,27 @@ def _seed_teams(info):
             _last_err.pop(("team", nm), None)
 
 
+def _warm_shots():
+    return bool(os.getenv("PICK6_WEBHOOK_URL")) and PICK6_WARM
+
+
+def _warm_player(info):
+    """Look up a player (and both teams) into memory without making a pick. Teams first, so leagues with no data cost almost nothing."""
+    try:
+        team, opp, name = info.get("team"), info.get("opp"), info.get("name")
+        if not (MATCHUP and KEY and team and opp):
+            return
+        tid = _cached(("team", team), lambda: _team_id(team))
+        oid = _cached(("team", opp), lambda: _team_id(opp))
+        if not (tid and oid):
+            return
+        if not (_cached(("form", tid), lambda: _form(tid)) and _cached(("form", oid), lambda: _form(oid))):
+            return
+        _cached(("player", name, team), lambda: _player(name, team, tid))
+    except Exception as e:
+        print("warm lookup failed:", info.get("name"), e)
+
+
 def lean_for(info):
     """One entry point for every kind of line."""
     try:
@@ -1027,6 +1049,9 @@ def lean_for(info):
             note += "\n   ℹ️ Under is not offered on this line."
             return note, False, why
         return note, juicy, why
+    if stat == "shots" and not PROP_SHOTS:
+        _warm_player(info)                                      # v22: no shots picks; only gather data for the Pick6 fouls guide
+        return "", False, ""
     odds = info.get("odds") or ""
     if (odds == "goblin" and not PROP_GOBLINS) or (odds == "demon" and not PROP_DEMONS):
         return "", False, ""                                    # v17: this kind of shots/tackles line is switched off: stay quiet
@@ -1084,7 +1109,7 @@ def parse(data):
             stat = str(attrs.get("stat_display_name", "")).lower()
             if "pass" in stat and "attempt" in stat:
                 kind = "passes"
-            elif PROP_SHOTS and stat in ("shots", "shots attempted"):
+            elif (PROP_SHOTS or _warm_shots()) and stat in ("shots", "shots attempted"):
                 kind = "shots"
             elif PROP_TACKLES and stat == "tackles":
                 kind = "tackles"
@@ -1791,7 +1816,7 @@ def main():
         extra = f"\n{status()}" if MATCHUP else "\nMatchup lookups are OFF (line alerts only)."
         r = _post({
             "content": f"✅ Captain Hook live: tracking {n_pass} soccer Passes lines"
-                       + (f" + {n_sh} Shots / {n_tk} Tackles lines (these post ONLY when juicy)" if (n_sh or n_tk) else "") + ". "
+                       + ((f" + {n_sh} Shots / {n_tk} Tackles lines (these post ONLY when juicy)" if PROP_SHOTS else f" (shots picks OFF; {n_sh} shots-line players looked up for the Pick6 fouls guide only)") if (n_sh or n_tk) else "") + ". "
                        f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER. "
                        f"A results recap posts after the games finish.\nPrizePicks line types: {odds_txt} (demon/goblin = More only)"
                        f"{extra}"})
