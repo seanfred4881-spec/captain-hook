@@ -1,4 +1,4 @@
-# Captain Hook v22 = v21 + shots picks OFF +  Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v25 = v24 + warning when two possession teams meet (game script decides). v24 = v23 + results recap OFF (RECAP_POSTS=true brings it back) + recap lists only graded picks (no more "no final stats yet" rows); late stats are posted in a follow-up instead. v23 = v22 + squad fallback by full club roster (Nico Paz) + no half-empty stats kept from the squad search (Jacobo Ramón). v22 = v21 + shots picks OFF +  Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math, difflib
 from datetime import datetime, timezone, timedelta
@@ -37,6 +37,7 @@ STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
 DOM_HOLD = float(os.getenv("DOM_HOLD", "1.30"))   # v22: from this possession ratio the pick is NOT juicy; the post says the mismatch points the other way (Ipswich v Man City). 0 = off
 DOM_WARN = float(os.getenv("DOM_WARN", "1.15"))   # v19: ... from this ratio, a warning on the pick
 BENCH_MIN = float(os.getenv("BENCH_MIN", "60"))   # v20: a player averaging fewer minutes than this is treated as a bench/rotation player
+POSS_BIG = float(os.getenv("POSS_BIG", "500"))      # v25: a team that usually makes this many passes a game is a "possession team"
 MARKET_WARN = float(os.getenv("MARKET_WARN", "0.20"))   # v18: a lean that fights the line by this share of his season average gets a warning (0 = off)
 MARKET_SKIP = float(os.getenv("MARKET_SKIP", "0.30"))   # v18: ... and by this much it is not tagged juicy at all (0 = off)
 CACHE_HOURS = float(os.getenv("CACHE_HOURS", "24"))
@@ -321,9 +322,30 @@ def _squad_pick(tid, parts, first, last, one_name):
         if pool:
             pl = pool[0]
             item = next((it for it in squad if (it.get("player") or {}).get("id") == pl.get("id")), None)
-            if item and item.get("statistics"):
+            has_passes = any(((st.get("passes") or {}).get("total") is not None) for st in ((item or {}).get("statistics") or []))
+            if item and has_passes:                   # v23: keep these stats only if they include passes; otherwise fetch his full season
                 _cache[("pdata", pl["id"])] = (time.time() + CACHE_HOURS * 3600, [item])
             print("player matched in club squad:", " ".join(parts), "->", pl.get("firstname"), pl.get("lastname"), "id", pl.get("id"))
+            return pl
+    # v23: the name search inside a squad only matches surnames of 4+ letters ("Paz" is too short). Fall back to the club's full
+    # roster (one call per club, remembered) and match the display name locally ("N. Paz").
+    try:
+        roster = _cached(("squad", tid), lambda: _get("/players/squads", {"team": tid})) or []
+    except RuntimeError as e:
+        if "cap" in str(e) or "429" in str(e):
+            raise
+        roster = []
+    cands = []
+    for blk in roster:
+        for pl in (blk.get("players") or []):
+            if pl.get("id") and pl.get("name"):
+                cands.append({"player": {"id": pl["id"], "firstname": "", "lastname": "", "name": pl["name"]}})
+    if cands:
+        ex, io, sg = _scan(cands, first, last, one_name, full)
+        pool = (sg + io) if one_name else (ex or io)
+        if len(pool) == 1:
+            pl = pool[0]
+            print("player matched in club roster:", " ".join(parts), "->", pl.get("name"), "id", pl.get("id"))
             return pl
     return None
 
@@ -786,6 +808,14 @@ def lean_ex(name, team, opp, line):
             dom_line = (f"\n   {risky}: possession mismatch, {'the opponent' if gap > 0 else 'his team'} usually makes {ratio:.2f}× the passes "
                         f"({(of if gap > 0 else tf)['made']:.0f} vs {(tf if gap > 0 else of)['made']:.0f}). "
                         f"{'His team may chase the ball all game.' if gap > 0 else 'His team may have the ball all game.'}")
+
+    # v25: two possession teams (Arsenal v Liverpool). Neither dominates on paper, so the game script decides: the side that scores
+    # first usually lets the other have the ball, and pass counts swing. Still juicy, but say so.
+    if juicy and POSS_BIG and tf.get("made") and of.get("made") and min(tf["made"], of["made"]) >= POSS_BIG:
+        r2 = max(tf["made"], of["made"]) / min(tf["made"], of["made"])
+        if r2 < (DOM_WARN or 1.15):
+            dom_line += (f"\n   ⚖️ Two possession teams ({tf['made']:.0f} vs {of['made']:.0f} passes a game): the game script decides. "
+                         f"The team that scores first often sits back and lets the other have the ball, so passes can swing either way.")
 
     sub_line = ""
     if juicy and not is_gk and risk["apps"] >= SUB_MIN_APPS:
@@ -1346,8 +1376,11 @@ RECAP_DAY_CUTOFF = int(os.getenv("RECAP_DAY_CUTOFF_HOUR", "6"))            # a g
 RECAP_AFTER_MIN = int(os.getenv("RECAP_AFTER_MINUTES", "105"))             # start looking for a final score this long after kickoff
 RECAP_EVERY_MIN = int(os.getenv("RECAP_CHECK_MINUTES", "15"))              # how often to check unfinished games
 RECAP_MAX_WAIT_H = float(os.getenv("RECAP_MAX_WAIT_HOURS", "5"))           # post anyway this long after the last kickoff
+RECAP_POSTS = os.getenv("RECAP_POSTS", "false").lower() == "true"          # v24: results recap OFF. Picks are still remembered for the lineup alerts
+RECAP_GIVEUP_H = float(os.getenv("RECAP_GIVEUP_HOURS", "36"))              # v24: keep trying to grade a pick this long after kickoff (late stats get a follow-up post)
 RECAP_KEEP = int(os.getenv("RECAP_KEEP_CALLS", "15"))                      # never let the recap use the last N calls of the day
 _ledger = {}
+_recap_days = set()                                                         # v24: days that already got their main recap
 _recap = {"next": 0.0}
 _fxs = {}                                                                  # (team id, date) -> (checked at, fixture)
 _fxp_done = {}                                                             # fixture id -> player stats, kept once the game is final
@@ -1464,18 +1497,21 @@ def _settle_one(e, now):
         return
     f = _fixture_for(e)
     if not f:
+        e["why"] = "match not found"
         return
     st = f["fixture"]["status"]["short"]
     if st in DEAD:
         e["state"], e["note"] = "VOID", "match postponed or cancelled"
         return
     if st not in FINAL:
+        e["why"] = f"match not final ({st})"
         return                                              # still being played
     fid = f["fixture"]["id"]
     blocks = _fxp_done.get(fid)
     if blocks is None:
         blocks = _get("/fixtures/players", {"fixture": fid})
         if not blocks:
+            e["why"] = "player stats not out yet"
             return                                          # stats are not out yet, try again next round
         _fxp_done[fid] = blocks
     found = None
@@ -1527,7 +1563,8 @@ def _post_recap(date_label, members):
     l = len(done) - w
     v = sum(1 for e in members if e["state"] == "VOID")
     u = sum(1 for e in members if e["state"] == "NODATA")
-    lines = [_entry_line(e) for e in members]
+    shown = [e for e in members if e["state"] in ("WIN", "LOSS", "VOID")]     # v24: ungraded picks are not listed
+    lines = [_entry_line(e) for e in shown]
     _rec["w"] += w
     _rec["l"] += l
     _rec["v"] += v
@@ -1537,7 +1574,7 @@ def _post_recap(date_label, members):
     for e in done:
         per.setdefault(e.get("stat", "passes"), [0, 0])[0 if e["state"] == "WIN" else 1] += 1
     by_prop = ("\nBy prop: " + " • ".join(f"{STAT_LABEL[k]} {a}-{b}" for k, (a, b) in per.items())) if len(per) > 1 else ""
-    foot = (f"\n\nTonight: **{w}-{l}**" + (f" (+{v} void)" if v else "") + (f" (+{u} not graded)" if u else "") + by_prop
+    foot = (f"\n\nTonight: **{w}-{l}**" + (f" (+{v} void)" if v else "") + by_prop
             + "\n\n**Record**" + (f" ({round(100 * tw / (tw + tl))}%)" if (tw + tl) else "")
             + f"\n✅ {tw} wins\n❌ {tl} losses")
     embed = {"title": f"📋 Captain Hook — results — {date_label}", "description": ("\n".join(lines) + foot)[:4000],
@@ -1549,7 +1586,7 @@ def _post_recap(date_label, members):
             _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
         except Exception as e:
             print("juicy channel recap post failed:", e)
-    for e in members:
+    for e in shown:
         e["recapped"] = True
     print(f"Recap posted for {date_label}: {w}-{l}-{v}, running record {_rec['w']}-{_rec['l']}-{_rec['v']}")
 
@@ -1763,6 +1800,10 @@ def settle_and_recap():
     if not RECAP or not _ledger or not WEBHOOK_URL:
         return
     now = _utcnow()
+    if not RECAP_POSTS:                                     # v24: no recap. Just forget picks 2 days after kickoff (no grading calls)
+        for k in [k for k, e in _ledger.items() if now > e["start"] + timedelta(hours=48)]:
+            del _ledger[k]
+        return
     if CAP - calls_used() >= RECAP_KEEP:
         for e in _ledger.values():
             if e["state"] == "OPEN":
@@ -1781,14 +1822,26 @@ def settle_and_recap():
             post_at = datetime.combine(d + timedelta(days=1), datetime.min.time(), tzinfo=_tz()) + timedelta(hours=RECAP_POST_HOUR)
             if now < post_at:
                 continue
-        if any(e["state"] == "OPEN" for e in members):
-            if now < max(e["start"] for e in members) + timedelta(hours=RECAP_MAX_WAIT_H):
-                continue                                    # still waiting on a game
-            for e in members:
-                if e["state"] == "OPEN":
-                    e["state"], e["note"] = "NODATA", "no final stats yet"
-        members.sort(key=lambda e: e["start"])
-        _post_recap(d.strftime("%a %b %d").replace(" 0", " "), members)
+        last_ko = max(e["start"] for e in members)
+        if RECAP_POST_HOUR < 0 and any(e["state"] == "OPEN" for e in members) and now < last_ko + timedelta(hours=RECAP_MAX_WAIT_H):
+            continue                                        # (post-as-soon-as-done mode) still waiting on a game
+        graded = [e for e in members if e["state"] in ("WIN", "LOSS", "VOID")]
+        waiting = [e for e in members if e["state"] == "OPEN"]
+        # v24: picks that will never be graded (no match / no stats for him) or that waited too long are dropped quietly
+        for e in members:
+            if e["state"] == "NODATA" or (e["state"] == "OPEN" and now > e["start"] + timedelta(hours=RECAP_GIVEUP_H)):
+                print("recap: not graded, dropped:", e["name"], e.get("note") or e.get("why") or "")
+                e["recapped"] = True
+        if not graded:
+            continue                                        # nothing to post yet (late stats keep being checked)
+        graded.sort(key=lambda e: e["start"])
+        label = d.strftime("%a %b %d").replace(" 0", " ")
+        if d in _recap_days:
+            label += " (late results)"
+        _post_recap(label, graded)
+        _recap_days.add(d)
+        if waiting:
+            print("recap: still waiting on", len(waiting), "pick(s):", ", ".join(f"{e['name']} ({e.get('why', '?')})" for e in waiting))
 
 
 def main():
@@ -1818,7 +1871,7 @@ def main():
             "content": f"✅ Captain Hook live: tracking {n_pass} soccer Passes lines"
                        + ((f" + {n_sh} Shots / {n_tk} Tackles lines (these post ONLY when juicy)" if PROP_SHOTS else f" (shots picks OFF; {n_sh} shots-line players looked up for the Pick6 fouls guide only)") if (n_sh or n_tk) else "") + ". "
                        f"All new lines and bumps post. Juicy matchups: 🔥 = lean OVER, 🧊 = lean UNDER. "
-                       f"A results recap posts after the games finish.\nPrizePicks line types: {odds_txt} (demon/goblin = More only)"
+                       f"" + ("A results recap posts after the games finish." if RECAP_POSTS else "") + f"\nPrizePicks line types: {odds_txt} (demon/goblin = More only)"
                        f"{extra}"})
         print(f"Startup message -> Discord status {r.status_code}")
         print(status())
