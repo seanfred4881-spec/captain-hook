@@ -1,8 +1,779 @@
-# Captain Hook v25 = v24 + warning when two possession teams meet (game script decides). v24 = v23 + results recap OFF (RECAP_POSTS=true brings it back) + recap lists only graded picks (no more "no final stats yet" rows); late stats are posted in a follow-up instead. v23 = v22 + squad fallback by full club roster (Nico Paz) + no half-empty stats kept from the squad search (Jacobo Ramón). v22 = v21 + shots picks OFF +  Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
+# Captain Hook v28 = v27 + GOALIE SAVES and GOALIE FANTASY SCORE props (juicy only, own on/off variables) + 🧤 keeper pair card (saves Over + fantasy Under on the same keeper) + goblin saves lines allowed (More only, higher bar). v27 = v26 + #error posts ONLY line errors that Underdog or Sleeper confirm (no more PrizePicks-only traps; HB_ERRORS_CONFIRMED_ONLY=false brings them back). v26 = v25 + #error channel: line-error alerts built in (same PrizePicks board it already downloads, no API-Football credits). One file. If that part ever breaks, the passes bot keeps running. v25 = v24 + warning when two possession teams meet (game script decides). v24 = v23 + results recap OFF (RECAP_POSTS=true brings it back) + recap lists only graded picks (no more "no final stats yet" rows); late stats are posted in a follow-up instead. v23 = v22 + squad fallback by full club roster (Nico Paz) + no half-empty stats kept from the squad search (Jacobo Ramón). v22 = v21 + shots picks OFF +  Pick6 fouls guide (fouls drawn / committed projections per game, own channel via PICK6_WEBHOOK_URL). v21 = v20 + players searched inside their own club's squad first (Fermín López, common surnames). v20 = v19 + teams found from the actual fixture (both clubs on that date), not just a name search +  v19 + player names that are first+middle names (Carlos Miguel) + several same-name candidates decided by club. v19 = v18 + possession-mismatch guard + far fewer wasted calls (teams checked before players; "no data" remembered 24h) + uses the full plan limit (7,400 of 7,500) + team search tries each word of the name (Bodø/Glimt) + club check on the matched player. v18 = v17 + (1) team lookup picks the real club, not a youth/women side (Roma, Milan...), (2) market guard: a lean that fights a line far from his season average is warned/held back, (3) lineup alert for juicy picks. v17 = v16 + shots/tackles UNDER picks only on standard lines (demon/goblin lines are More-only) + no under on More-only (demon/goblin) lines + position shown. v16 = v15 + SHOTS and TACKLES props (juicy-only, own on/off variables, graded in the recap). v15 = v14 + team-form check explains WHY it fails + tolerant of cup games without stats + startup status fix. v14 = v13 + club short-name aliases (Man Utd, Spurs...) + short-surname search fix. v13 = v12 + optional second channel for JUICY picks only (set JUICY_WEBHOOK_URL; leave it out and nothing changes)
 # v12 = v11 + nightly results recap (RECAP_ENABLED=false turns the recap off)
 import requests, time, os, unicodedata, re, math, difflib
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+
+# ====================== v26: #error CHANNEL (line errors, built in, kept separate from the passes code) ======================
+_HB_ERRORS_SRC = r'''
+"""Heartbeat ERRORS for Captain Hook (v1.0). Taken from Heartbeat v3.0. ALERT ONLY, never places bets.
+
+Posts PrizePicks line errors to your #error channel (and small ones to #value if VALUE_WEBHOOK_URL is set):
+  - a 😈 demon 30%+ and 2+ points BELOW the normal line (Pickens 34.5 vs 64.5)  -> #error
+  - a 😈 demon a bit below the normal line (Dunn 4.5 vs 5.5)                      -> #value
+  - a 👺 goblin ABOVE the normal line, only when Underdog or Sleeper confirm it   -> #error
+  - one app's line way below PrizePicks / Underdog / Sleeper (Harden assists 3.5 vs 8.5) -> #error, smaller -> #value
+Each error is checked against Underdog and Sleeper ("✅ Confirmed", "⚠️ small edge" or "PrizePicks only").
+
+HOW IT'S USED: Captain Hook's main loop calls heartbeat_errors.check(raw) with the PrizePicks board it already
+downloads every minute, so there is no extra PrizePicks call. It runs in the background and never touches
+Captain Hook's own picks. (start() is also here if you ever want it to run on its own.)
+Railway variable needed: ERRORS_WEBHOOK_URL (your #error webhook). Optional: VALUE_WEBHOOK_URL.
+"""
+import gc
+import json
+import os
+import re
+import threading
+import time
+import unicodedata
+from datetime import datetime, timezone
+
+import requests
+
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:
+    _ET = timezone.utc
+
+PP_URL = os.getenv("PP_URL", "https://partner-api.prizepicks.com/projections?per_page=1000&single_stat=true&game_mode=pickem")
+PRE_WINDOW_H = float(os.getenv("HB_PRE_WINDOW_HOURS", "24"))
+EVERY = float(os.getenv("HB_ERRORS_EVERY_SECONDS", "60"))           # read PrizePicks once a minute
+WEBHOOK_URL = None
+_STATE_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "/tmp"
+STATE_FILE = os.path.join(_STATE_DIR, "heartbeat_errors_state.json")
+_state = {}
+
+
+def _norm(s):
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = re.sub(r"[^a-z ]", "", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _to_dt(s):
+    try:
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _num(x, default=0.0):
+    try:
+        return float(str(x).replace("+", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+
+def _post(payload, url=None):
+    url = url or WEBHOOK_URL
+    if not url:
+        print("no WEBHOOK_URL set, would have posted:", str(payload)[:300])
+        return
+    for _ in range(4):
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+        except requests.RequestException as e:
+            print("discord post failed:", e)
+            time.sleep(2)
+            continue
+        if r.status_code == 429:
+            try:
+                wait = float(r.json().get("retry_after", 2))
+            except Exception:
+                wait = 2.0
+            time.sleep(min(wait, 10) + 0.3)
+            continue
+        if r.status_code >= 300:
+            print("discord error", r.status_code, r.text[:120])
+        return
+
+
+
+def _start_txt(dt):
+    try:
+        return dt.astimezone(_ET).strftime("%a %-I:%M %p") + (" ET" if _ET is not timezone.utc else " UTC")
+    except Exception:
+        return ""
+
+
+
+PP_BOARD_URL = os.getenv("HB_PP_LINK", "https://app.prizepicks.com/board")
+PP_LINK_TXT = f"👉 [Open PrizePicks](<{PP_BOARD_URL}>) (search the player name)"   # v3.0: one tap to the board
+
+# ====================== LINE ERRORS (v3.0, all sports, own channel) ======================
+# Posts ONLY when PrizePicks' own lines contradict each other (a pricing mistake), so the channel stays quiet:
+#   1) a 😈 DEMON line that is at or BELOW the same player's standard line (a demon is supposed to be harder)
+#   2) a combo line (PRA, Pts+Rebs, Rush+Rec Yds, Kills combos...) at or BELOW one of its own parts' lines
+#   (form-based "value" checks were removed: only lines that contradict each other count as errors)
+# Needs ERRORS_WEBHOOK_URL (any variable name with ERROR + WEBHOOK). Without it, errors are only written to the log.
+ERRORS_WEBHOOK_URL = os.getenv("ERRORS_WEBHOOK_URL") or next(
+    (v.strip() for k, v in os.environ.items() if "ERROR" in k.upper() and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)
+ERR_ON = os.getenv("HB_ERRORS", "true").lower() == "true"
+ERR_ONLY_DEMONS = os.getenv("HB_ERRORS_ONLY_DEMONS", "true").lower() == "true"   # v3.0: only Pickens-type errors
+ERR_DEMON_BIG = float(os.getenv("HB_ERRORS_DEMON_BIG", "0.70"))     # v3.0: a demon must be 30%+ below the regular line
+ERR_DEMON_MIN_PTS = float(os.getenv("HB_ERRORS_DEMON_MIN_POINTS", "2"))  # ...and 2+ points below (4.5 vs 5.5 is NOT an error)
+ERR_DEMON_GAP = float(os.getenv("HB_ERRORS_DEMON_GAP", "0.85"))  # demon must be 15%+ below the regular line (34.5 vs 64)
+ERR_CONFIRM_S = float(os.getenv("HB_ERRORS_CONFIRM_SECONDS", "180"))   # must still be on the board 3 minutes later
+ERR_CONFIRMED_ONLY = os.getenv("HB_ERRORS_CONFIRMED_ONLY", "true").lower() == "true"   # v27: post only if Underdog/Sleeper confirm
+# v3.0: leagues to leave out of the error check (college props aren't allowed in every state). Comma list, PrizePicks names.
+ERR_SKIP = {x.strip().upper() for x in os.getenv("HB_ERRORS_SKIP_LEAGUES", "").split(",") if x.strip()}
+_ERR_PART = {"pts": "points", "points": "points", "rebs": "rebounds", "reb": "rebounds", "rebounds": "rebounds",
+             "asts": "assists", "ast": "assists", "assists": "assists", "blks": "blocked shots", "blocks": "blocked shots",
+             "stls": "steals", "steals": "steals", "rush": "rush yards", "rec": "receiving yards", "receiving": "receiving yards",
+             "pass": "pass yards", "goals": "goals", "sog": "shots on goal"}
+
+
+def _err_norm_stat(t):
+    return re.sub(r"\s+", " ", re.sub(r"[()]", " ", str(t or "").lower())).strip()
+
+
+
+
+
+# v3.0: 🔥 FREE = a huge gap on a stat that piles up (yards, points, PRA...): the line is under 60% of the other line.
+# Low-count stats (soccer shots, goals, steals, blocks, TDs, aces...) are never "free": one bad game and it misses.
+_LOW_COUNT = ("shot", "goal", "save", "steal", "block", "touchdown", "td", "ace", "double fault", "home run", "stolen",
+              "sack", "interception", "3-pt", "3pt", "three", "made", "turnover", "foul", "hit", "assist", "card", "corner",
+              "break point", "tie break", "set", "map", "kill", "headshot", "walk", "rbi", "run", "strikeout")
+
+
+def _is_free(stat, why):
+    t = str(stat).lower()
+    nums = re.findall(r"(?:Normal line|Demon|Goblin): ([0-9.]+)", why)
+    if len(nums) < 2:
+        return False
+    a, b = sorted(float(x) for x in nums[:2])
+    if b <= 0:
+        return False
+    if "yard" in t and b < 10:                    # v3.0: tiny yards lines (backups who barely play) are never "free"
+        return False
+    low = any(w in t for w in _LOW_COUNT) and not any(w in t for w in ("yard", "fantasy", "pts", "points", "rebs", "rebounds"))
+    if low:                                       # small stats (shots, steals...): only a HUGE gap, like Messi shots 2 vs 5
+        return a <= 0.45 * b and b - a >= 2
+    return a <= 0.6 * b
+
+
+def _second_opinion(lg, P, stat, line):
+    """('confirmed' | 'disagree' | None, [(app, line)]): the same player + stat on Underdog / Sleeper.
+    confirmed = their line is clearly ABOVE the PrizePicks line we'd play (the low number really is a gift).
+    disagree = they're at or near the PrizePicks number (it's just the ladder that's off)."""
+    hit = _state.get("xapp_idx")
+    if not hit or time.time() - hit[0] > 20 * 60:
+        return None, []
+    k = _xstat(stat)
+    if not k:
+        return None, []
+    key = (str(lg).upper(), _norm(P["name"]), k)
+    others = [(a, idx[key][0]) for a, idx in hit[1].items() if key in idx]
+    if not others:
+        return None, []
+    lo = min(v for _, v in others)
+    if lo >= line + max(1.0, 0.15 * line):
+        return "confirmed", others
+    return "disagree", others
+
+
+def error_scan(raw):
+    players, leagues, games = {}, {}, {}
+    for inc in raw.get("included", []) or []:
+        a = inc.get("attributes", {}) or {}
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = (a.get("name", ""), a.get("team") or "", )
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+    rows, types = {}, {}
+    now = _now()
+    for item in raw.get("data", []) or []:
+        try:
+            if item.get("_live_feed"):
+                continue
+            a = item["attributes"]
+            rel = item.get("relationships", {})
+            if str(a.get("is_live")).lower() == "true" or str(a.get("in_game")).lower() == "true":
+                continue
+            st = _to_dt(a.get("start_time"))
+            if not st or st <= now or (st - now).total_seconds() > PRE_WINDOW_H * 3600:
+                continue
+            lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            name, team = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), ("", ""))
+            line = _num(a.get("line_score"))
+            if not lg or not name or line <= 0 or " + " in name or lg in ERR_SKIP:
+                continue
+            if re.search(r"[1-4]Q$|QTR|QUARTER", lg) or re.search(r"\b(1q|2q|3q|4q|1st quarter|quarter)\b",
+                                                                         str(a.get("stat_display_name") or "").lower()):
+                continue                                  # v3.0: no quarter lines (one foul and it's gone)
+            ot = str(a.get("odds_type") or "standard").lower()
+            stat = _err_norm_stat(a.get("stat_display_name") or a.get("stat_type"))
+            if "combo" in stat:
+                continue
+            gid0 = (rel.get("game", {}).get("data") or {}).get("id")
+            P = rows.setdefault((lg, _norm(name), gid0), {"name": name, "team": team, "start": st, "opp": a.get("description") or "",
+                                                     "gid": (rel.get("game", {}).get("data") or {}).get("id"), "lines": {}})
+            promo = str(a.get("is_promo")).lower() == "true"
+            flash = _num(a.get("flash_sale_line_score"), 0)
+            kind = "promo" if promo else ot                   # v3.0: PrizePicks promo/discount lines are checked too
+            types[kind] = types.get(kind, 0) + 1
+            P["lines"].setdefault(stat, {}).setdefault(kind, []).append(line)
+            if flash and flash != line:                       # a flash-sale price on this line
+                P["lines"][stat].setdefault("promo", []).append(flash)
+                types["flash"] = types.get("flash", 0) + 1
+        except Exception:
+            continue
+    found = []
+    for (lg, norm, _g), P in rows.items():
+        L = P["lines"]
+        for stat, by in L.items():
+            std = by.get("standard")
+            mid_move = bool(std) and len(set(std)) > 1      # two different regular lines at once = PrizePicks mid-move
+            # 1) demon at or below the standard line (while mid-move: only if it's far below EVERY regular line)
+            if std and by.get("demon"):
+                s0 = min(std)
+                for d in sorted(set(by["demon"])):
+                    if d <= ERR_DEMON_BIG * s0 and s0 - d >= ERR_DEMON_MIN_PTS and (not mid_move or d <= 0.75 * s0):
+                        found.append((lg, P, stat, "demon", d, "MORE",
+                                      f"Normal line: {s0:g}\n😈 Demon: {d:g}"))
+                    elif d <= 0.92 * s0 and s0 - d >= 1 and not mid_move:   # v3.0: smaller demon gap -> #value
+                        found.append((lg, P, stat, "demon_small", d, "MORE",
+                                      f"Normal line: {s0:g}\n😈 Demon: {d:g}"))
+            if mid_move:
+                continue
+            # 1c) a GOBLIN at or above the regular line: then the REGULAR line is the easier one and pays more
+            if std and by.get("goblin"):
+                s0 = max(std)
+                g = max(by["goblin"])
+                if g >= s0:
+                    found.append((lg, P, stat, "regular", s0, "MORE",
+                                  f"Normal line: {s0:g}\n👺 Goblin: {g:g}", g))
+            # 1b) a promo / flash-sale line far below the standard line (PrizePicks discount: worth knowing)
+            if std and by.get("promo"):
+                s0 = min(std)
+                for d in sorted(set(by["promo"])):
+                    if d <= s0 * 0.8:
+                        found.append((lg, P, stat, "promo", d, "MORE",
+                                      f"🏷️ Promo / discounted line {d:g} vs his standard line {s0:g}. "
+                                      f"PrizePicks put this one on sale, so it's way easier than normal: take the More"))
+            # 2) combo line at or below one of its own parts
+            # v3.0 fix: only compare like with like. A yards combo vs yards parts, an NBA combo vs its NBA parts.
+            # Anything with another unit (TDs, attempts, completions...) is skipped, and the part line must be close
+            # to the combo line (a real mistake is a near miss, not 1.5 vs 227.5).
+            words = set(re.findall(r"[a-z]+", stat))
+            yards = bool(words & {"yds", "yards"})
+            other_unit = bool(words - {"yds", "yards", "pts", "rebs", "asts", "blks", "stls", "rush", "rec", "pass",
+                                       "points", "rebounds", "assists", "receiving"})
+            if std and "+" in stat and not other_unit:
+                base = re.sub(r"\b(yds|yards)\b", "", stat).strip()
+                parts = [x.strip() for x in base.split("+") if x.strip()]
+                part_names = []
+                for x in parts:
+                    nm = _ERR_PART.get(x.split()[0])
+                    if not nm or (yards != nm.endswith("yards")):
+                        part_names = []
+                        break
+                    part_names.append(nm)
+                c0 = min(std)
+                for pn in part_names:
+                    ps = (L.get(pn) or {}).get("standard")
+                    if yards:
+                        # yards can go NEGATIVE (QB kneel-downs, sacks on scrambles), so a yards combo is only a
+                        # mistake if it's strictly below the part AND every other part is clearly positive (line 10+)
+                        others = [(L.get(o) or {}).get("standard") for o in part_names if o != pn]
+                        if not ps or not others or not all(o and min(o) >= 10 for o in others) or not c0 < max(ps):
+                            continue
+                    if ps and c0 <= max(ps) <= c0 * 1.5:
+                        found.append((lg, P, stat, "standard", c0, "MORE",
+                                      f"{stat.title()} line {c0:g} is at or below his {pn.title()} line {max(ps):g} on its own. "
+                                      f"The combo always counts at least that much, so this is a PrizePicks mistake: take the combo More"))
+                        break
+    if time.time() - _state.get("err_log_t", 0) > 3600:
+        _state["err_log_t"] = time.time()
+        print(f"LINE ERROR CHECK: line types on the board {types} | {len(found)} errors found | "
+              f"channel {'set' if ERRORS_WEBHOOK_URL else 'NOT SET (log only)'}")
+    sent = _state.setdefault("err_sent", {})
+    if ERR_ONLY_DEMONS:                               # v3.0: only Pickens-type errors (a demon clearly below the regular line)
+        # v3.0: the clear ones only: a demon 15%+ BELOW the regular line, or a goblin 15%+ ABOVE it
+        # (then the REGULAR line is the mistake, like Tjen aces 4.5 with a goblin at 6.5)
+        found = [x[:7] for x in found if x[3] in ("demon", "demon_small")
+                 or (x[3] == "regular" and len(x) > 7 and x[4] <= ERR_DEMON_GAP * x[7])]
+    found = [x[:7] for x in found]
+    seen = _state.setdefault("err_seen", {})          # v3.0: an error must still be there 3+ minutes later to post
+    keys_now = set()
+    for lg, P, stat, ot, line, direction, why in found:
+        keys_now.add(f"{lg}|{P['name']}|{stat}|{ot}|{line:g}")
+    for k in [k for k in seen if k not in keys_now]:
+        del seen[k]                                   # it went away (PrizePicks was just moving lines): never posted
+    for lg, P, stat, ot, line, direction, why in found:
+        k = f"{lg}|{P['name']}|{stat}|{ot}|{line:g}"
+        if k in sent:
+            continue
+        seen.setdefault(k, time.time())
+        if time.time() - seen[k] < ERR_CONFIRM_S:
+            continue
+        sent[k] = time.time()
+        label = {"demon": " 😈 DEMON", "demon_value": " 😈 DEMON", "demon_small": " 😈 DEMON", "goblin": " 👺 GOBLIN", "promo": " 🏷️ PROMO"}.get(ot, "")
+        college = lg.startswith(("CFB", "CBB", "NCAA"))
+        kind_txt = "💰 VALUE" if ot in ("demon_small", "regular_small") else ("💎 DEMON VALUE" if ot == "demon_value" else "🚨 LINE ERROR")   # value = strong form, not a pricing mistake
+        title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {line:g}"
+        print("LINE ERROR:", title, "|", why)
+        dest = VALUE_WEBHOOK_URL if ot in ("demon_small", "regular_small") else ERRORS_WEBHOOK_URL
+        verdict, others = _second_opinion(lg, P, stat, line)     # v3.0: what do Underdog / Sleeper say?
+        if ot in ("regular", "regular_small") and verdict != "confirmed":
+            print(f"LINE ERROR skipped (goblin above the normal line, not confirmed by other apps): {P['name']} {stat} {line:g}")
+            continue                              # v3.0: a goblin alone is NOT an error (Guirassy shots 3.5 -> 1)
+        if others:
+            why += "\n" + " · ".join(f"{a.title()}: {v:g}" for a, v in others)
+        if dest == ERRORS_WEBHOOK_URL:
+            if verdict == "confirmed":
+                why = "✅ Confirmed by the other apps\n" + why
+            elif verdict == "disagree":
+                why = "⚠️ The other apps agree with PrizePicks' number, so the edge is small\n" + why
+                dest, kind_txt = VALUE_WEBHOOK_URL, "💰 VALUE"
+                title = f"{kind_txt} — {lg}: {P['name']} {stat.title()}{label} {line:g}"
+            else:
+                if ERR_CONFIRMED_ONLY:              # v27: not on Underdog/Sleeper = can't confirm = don't post (traps)
+                    print(f"LINE ERROR skipped (PrizePicks only, not confirmed): {P['name']} {stat} {line:g}")
+                    continue
+                why += "\nPrizePicks only (not on Underdog or Sleeper), not confirmed"
+        if dest == ERRORS_WEBHOOK_URL and _is_free(stat, why):
+            why = "🔥 FREE: the line is 40%+ below what PrizePicks itself expects\n" + why
+        if dest:
+            embed = {"title": title, "description": why, "color": 10181046 if ot == "demon_value" else 15158332,
+                     "fields": [{"name": f"{P['name']} ({P['team'] or lg})",
+                                 "value": f"{P['opp'] and 'vs ' + P['opp'] + ' • '}starts {_start_txt(P['start'])}", "inline": False}],
+                     "footer": {"text": "Model v3.0 • alert only • PrizePicks can fix a mistake fast, so check it's still there"}}
+            _post({"content": (f"{kind_txt.split()[0]} **{P['name']} — {stat.title()}{label} {line:g}**\n"
+                               + ("🎓 College: not available in every state\n" if college else "") + PP_LINK_TXT)[:1900],
+                   "embeds": [embed]}, dest)
+
+
+
+# ====================== CROSS-APP: PRIZEPICKS vs UNDERDOG (v3.0) ======================
+# Same player, same stat, same game, regular lines only. Fantasy score is left out (each app scores it differently).
+#   🚨 ERROR (→ #error): one app's line is 25%+ below the other's (like Harden assists 3.5 vs 8.5)
+#   💰 VALUE (→ #value, VALUE_WEBHOOK_URL): the lower line is at least 1 full point AND 10% below the other
+XAPP_ON = os.getenv("HB_CROSS_APP", "true").lower() == "true"
+XAPP_EVERY = float(os.getenv("HB_CROSS_APP_SECONDS", "300"))       # Underdog's board is big: read it every 5 minutes
+XAPP_ERR_GAP = float(os.getenv("HB_CROSS_APP_ERROR_GAP", "0.25"))
+XAPP_VAL_GAP = float(os.getenv("HB_CROSS_APP_VALUE_GAP", "0.10"))
+XAPP_VAL_MIN = float(os.getenv("HB_CROSS_APP_VALUE_POINTS", "1.0"))
+XAPP_VAL_PER_DAY = int(os.getenv("HB_CROSS_APP_VALUE_PER_DAY", "20"))
+VALUE_WEBHOOK_URL = os.getenv("VALUE_WEBHOOK_URL") or next(
+    (v.strip() for k, v in os.environ.items() if "VALUE" in k.upper() and "WEBHOOK" in k.upper()
+     and v.strip().startswith("http")), None)
+_XSTAT = [  # (canonical key, words that identify it) - checked in order, most specific first
+    ("pra", ("ptsrebsasts", "pointsreboundsassists", "pra")), ("pr", ("ptsrebs", "pointsrebounds")),
+    ("pa", ("ptsasts", "pointsassists")), ("ra", ("rebsasts", "reboundsassists")),
+    ("3pm", ("3pointersmade", "3ptmade", "3pm", "threepointersmade", "threesmade")),
+    ("rushrec", ("rushrecyds", "rushrecyards", "rushingreceivingyards", "rushandrecyards")),
+    ("passrush", ("passrushyds", "passrushyards", "passingrushingyards")),
+    ("passyds", ("passyards", "passingyards", "passyds")), ("rushyds", ("rushyards", "rushingyards", "rushyds")),
+    ("recyds", ("receivingyards", "recyards", "recyds")), ("rec", ("receptions",)),
+    ("passatt", ("passattempts", "passingattempts")), ("passcmp", ("passcompletions", "completions")),
+    ("rushatt", ("rushattempts", "rushingattempts", "carries")),
+    ("sog", ("shotsongoal", "sog")), ("saves", ("goaliesaves", "saves")), ("hits", ("hits",)),
+    ("blk", ("blockedshots", "blocks")), ("stl", ("steals",)), ("tov", ("turnovers",)),
+    ("pts", ("points",)), ("reb", ("rebounds",)), ("ast", ("assists",)),
+]
+
+
+def _xstat(name):
+    t = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if t in ("fantasyscore", "fantasypoints", "fantasypts"):
+        return "fant"                                     # v3.0: NBA only, PrizePicks vs Sleeper only (same scoring)
+    if not t or "fantasy" in t or "combo" in t or re.search(r"(1h|2h|1q|2q|3q|4q|1sthalf|quarter|period|inning|set)", t):
+        return None
+    for key, words in _XSTAT:
+        if t in words:
+            return key
+    return None
+
+
+def _pp_regular_index(raw):
+    """{(SPORT, player, stat key): (line, start)} for PrizePicks' REGULAR pregame lines (no demons/goblins)."""
+    players, leagues = {}, {}
+    for inc in raw.get("included", []) or []:
+        a = inc.get("attributes", {}) or {}
+        if inc.get("type") == "new_player":
+            players[inc["id"]] = a.get("name", "")
+        elif inc.get("type") == "league":
+            leagues[inc["id"]] = (a.get("name") or "").upper()
+    out, now = {}, _now()
+    for item in raw.get("data", []) or []:
+        try:
+            if item.get("_live_feed"):
+                continue
+            a, rel = item["attributes"], item.get("relationships", {})
+            if str(a.get("odds_type") or "standard").lower() != "standard" or str(a.get("is_promo")).lower() == "true":
+                continue
+            st = _to_dt(a.get("start_time"))
+            if not st or st <= now:
+                continue
+            lg = leagues.get((rel.get("league", {}).get("data") or {}).get("id"), "")
+            nm = players.get((rel.get("new_player", {}).get("data") or {}).get("id"), "")
+            k = _xstat(a.get("stat_display_name") or a.get("stat_type"))
+            line = _num(a.get("line_score"))
+            if k == "fant" and lg != "NBA":
+                continue
+            if lg and nm and k and line > 0 and " + " not in nm:
+                out[(lg, _norm(nm), k)] = (line, st, nm, a.get("description") or "")
+        except Exception:
+            continue
+    return out
+
+
+def _ud_index():
+    """{(SPORT, player, stat key): (line, start, name, higher x, lower x)} from Underdog's public board."""
+    hdr = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                         "Version/17.0 Mobile/15E148 Safari/604.1", "Accept": "application/json"}
+    r = requests.get("https://api.underdogfantasy.com/v1/over_under_lines", headers=hdr, timeout=30)
+    if r.status_code != 200:
+        print(f"CROSS-APP: Underdog said {r.status_code}")
+        return None
+    d = r.json()
+    del r
+    players = {p.get("id"): p for p in d.get("players", []) or []}
+    apps = {a.get("id"): a for a in d.get("appearances", []) or []}
+    games = {}
+    for g in (d.get("games", []) or []) + (d.get("solo_games", []) or []):
+        games[g.get("id")] = g
+    out, now = {}, _now()
+    for ln in d.get("over_under_lines", []) or []:
+        try:
+            if str(ln.get("status") or "active").lower() != "active":
+                continue
+            ou = ln.get("over_under") or {}
+            ast = ou.get("appearance_stat") or {}
+            k = _xstat(ast.get("display_stat") or ast.get("stat"))
+            if not k or k == "fant":
+                continue
+            app = apps.get(ast.get("appearance_id")) or {}
+            pl = players.get(app.get("player_id")) or {}
+            nm = f"{pl.get('first_name', '')} {pl.get('last_name', '')}".strip()
+            sport = str(pl.get("sport_id") or "").upper()
+            g = games.get(app.get("match_id")) or {}
+            st = _to_dt(g.get("scheduled_at") or g.get("starts_at"))
+            if not nm or not sport or (st and st <= now):
+                continue
+            mult = {str(o.get("choice") or "").lower(): _num(o.get("payout_multiplier"), 0) for o in ln.get("options", []) or []}
+            if "higher" not in mult or "lower" not in mult:
+                continue                                  # one-sided (boosted / special) lines are skipped
+            line = _num(ln.get("stat_value"))
+            if line > 0:
+                out[(sport, _norm(nm), k)] = (line, st, nm, mult["higher"], mult["lower"])
+        except Exception:
+            continue
+    del d
+    gc.collect()
+    return out
+
+
+# minimum point gap for a cross-app ERROR (a % gap alone lies on tiny lines like QB rush yards 0.5 vs 2.5)
+XAPP_ERR_MIN = {"fant": 8, "pts": 5, "reb": 3, "ast": 3, "pra": 7, "pr": 6, "pa": 6, "ra": 4, "3pm": 2, "stl": 2, "blk": 2,
+                "tov": 2, "passyds": 50, "rushyds": 20, "recyds": 20, "rushrec": 25, "passrush": 50, "rec": 2,
+                "passatt": 6, "passcmp": 5, "rushatt": 5, "sog": 1.5, "saves": 6, "hits": 1.5}
+XAPP_PRICED_IN = float(os.getenv("HB_CROSS_APP_PRICED_IN", "1.65"))   # More paying under 1.65x = not a mistake
+XAPP_MIN_LINE = {"rushyds": 10.5, "recyds": 10.5, "rushrec": 15.5}   # skip tiny yards lines (backup QBs, kneel-downs)
+_SLP_WAGER = {"points": "pts", "rebounds": "reb", "assists": "ast", "threes_made": "3pm", "three_pointers_made": "3pm",
+              "pts_reb_ast": "pra", "points_rebounds_assists": "pra", "pts_reb": "pr", "points_rebounds": "pr",
+              "pts_ast": "pa", "points_assists": "pa", "reb_ast": "ra", "rebounds_assists": "ra", "steals": "stl",
+              "blocks": "blk", "turnovers": "tov", "passing_yards": "passyds", "pass_yards": "passyds",
+              "rushing_yards": "rushyds", "rush_yards": "rushyds", "receiving_yards": "recyds", "rec_yards": "recyds",
+              "receptions": "rec", "rush_rec_yards": "rushrec", "rushing_receiving_yards": "rushrec",
+              "pass_rush_yards": "passrush", "passing_attempts": "passatt", "pass_attempts": "passatt",
+              "passing_completions": "passcmp", "pass_completions": "passcmp", "rushing_attempts": "rushatt",
+              "rush_attempts": "rushatt", "shots_on_goal": "sog", "shots": "sog", "saves": "saves", "goalie_saves": "saves",
+              "hits": "hits", "blocked_shots": "blk", "fantasy_points": "fant", "fantasy_score": "fant", "fantasy_pts": "fant"}
+
+
+def _slp_names(sport):
+    """Sleeper uses player numbers. Its free player list turns them into names (kept a day, names only)."""
+    cache = _state.setdefault("slp_names", {})
+    hit = cache.get(sport)
+    if hit and time.time() - hit[0] < 24 * 3600:
+        return hit[1]
+    try:
+        d = requests.get(f"https://api.sleeper.app/v1/players/{sport}", timeout=40).json()
+        names = {str(k): f"{v.get('first_name', '')} {v.get('last_name', '')}".strip()
+                 for k, v in d.items() if isinstance(v, dict)}
+        del d
+        gc.collect()
+    except Exception as e:
+        print(f"CROSS-APP: Sleeper {sport} player list failed:", e)
+        return hit[1] if hit else {}
+    cache[sport] = (time.time(), names)
+    return names
+
+
+def _slp_index():
+    """{(SPORT, player, stat key): (line, None, name, over x, under x)} from Sleeper's public board."""
+    hdr = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                         "Version/17.0 Mobile/15E148 Safari/604.1", "Accept": "application/json"}
+    r = requests.get("https://api.sleeper.app/lines/available?dynamic=true&include_preseason=true", headers=hdr, timeout=30)
+    if r.status_code != 200:
+        print(f"CROSS-APP: Sleeper said {r.status_code}")
+        return None
+    rows = r.json()
+    del r
+    if isinstance(rows, dict):
+        rows = next((v for v in rows.values() if isinstance(v, list)), [])
+    groups, unknown = {}, set()
+    for row in rows or []:
+        for o in (row.get("options") or []) if isinstance(row, dict) else []:
+            if str(o.get("status") or "active") != "active" or str(o.get("line_type") or "normal") != "normal" \
+                    or str(o.get("game_status") or "pre_game") != "pre_game" or o.get("subject_type", "player") != "player":
+                continue
+            wt = str(o.get("wager_type") or "").lower()
+            k = _SLP_WAGER.get(wt)
+            if not k:
+                unknown.add(wt)
+                continue
+            sport = str(o.get("sport") or "").lower()
+            if k == "fant" and sport != "nba":
+                continue
+            g = groups.setdefault((sport, str(o.get("subject_id")), k, o.get("game_id")), {})
+            g[str(o.get("outcome") or "").lower()] = (_num(o.get("outcome_value")), _num(o.get("payout_multiplier"), 0))
+    del rows
+    if unknown and not _state.get("slp_unknown_logged"):
+        _state["slp_unknown_logged"] = True
+        print("CROSS-APP: Sleeper stat names not used:", sorted(unknown)[:40])
+    out = {}
+    for (sport, sid, k, gid), g in groups.items():
+        if "over" not in g or "under" not in g or g["over"][0] != g["under"][0] or g["over"][0] <= 0:
+            continue
+        nm = _slp_names(sport).get(sid)
+        if nm:
+            out[(sport.upper(), _norm(nm), k)] = (g["over"][0], None, nm, g["over"][1], g["under"][1])
+    return out
+
+
+_X2BOX = {"NBA": {"pts": "pts", "reb": "reb", "ast": "ast", "pra": "pra", "pr": "pr", "pa": "pa", "ra": "ra",
+                  "3pm": "fg3", "stl": "stl", "blk": "blk", "tov": None},
+          "NHL": {"sog": "sog", "saves": "saves", "hits": "hits", "blk": "nhl_blk"},
+          "NFL": {"passyds": "pass_yds", "rushyds": "rush_yds", "recyds": "rec_yds", "rec": "rec_cnt",
+                  "passatt": "pass_att", "passcmp": "pass_cmp", "rushatt": "rush_att"}}
+
+
+def cross_app_scan(raw):
+    if time.time() - _state.get("xapp_t", 0) < XAPP_EVERY:
+        return
+    _state["xapp_t"] = time.time()
+    apps = {"PRIZEPICKS": _pp_regular_index(raw)}
+    for name, fn in (("UNDERDOG", _ud_index), ("SLEEPER", _slp_index)):
+        try:
+            got = fn()
+        except Exception as e:
+            print(f"CROSS-APP: {name} failed:", e)
+            got = None
+        if got:
+            apps[name] = got
+    _state["xapp_idx"] = (time.time(), {n: i for n, i in apps.items() if n != "PRIZEPICKS"})   # for error checks
+    keys = set()
+    for name, idx in apps.items():
+        if name != "PRIZEPICKS":
+            keys |= set(idx)
+    errs, vals = [], []
+    for key in keys:
+        have = {n: idx[key] for n, idx in apps.items() if key in idx}
+        if len(have) < 2:
+            continue
+        lo_app = min(have, key=lambda n: have[n][0])
+        lo = have[lo_app][0]
+        others = {n: v for n, v in have.items() if n != lo_app}
+        ref = min(v[0] for v in others.values())          # the lowest of the OTHER apps: lo must beat all of them
+        if ref <= 0 or lo >= ref:
+            continue
+        if len(others) >= 2 and max(v[0] for v in others.values()) > ref * 1.15:
+            continue                                      # the other apps don't agree with each other: skip
+        tiny = key[2] in XAPP_MIN_LINE and ref < XAPP_MIN_LINE[key[2]]   # e.g. QB rush yards 0.5 vs 2.5: value, not error
+        gap = (ref - lo) / ref
+        row = (key, have, lo_app, lo, ref, gap)
+        lo_more = have[lo_app][3] if lo_app != "PRIZEPICKS" and len(have[lo_app]) > 3 else 0
+        priced_in = bool(lo_more) and lo_more < XAPP_PRICED_IN    # the app already pays LESS for More: it knows
+        if not tiny and not priced_in and gap >= XAPP_ERR_GAP and ref - lo >= XAPP_ERR_MIN.get(key[2], 2):
+            errs.append(row)
+        elif gap >= XAPP_VAL_GAP and ref - lo >= (3.0 if key[2] == "fant" else XAPP_VAL_MIN):
+            vals.append(row)
+    if time.time() - _state.get("xapp_log_t", 0) > 3600:
+        _state["xapp_log_t"] = time.time()
+        print(f"CROSS-APP CHECK: " + ", ".join(f"{n} {len(i)}" for n, i in apps.items()) +
+              f" | {len(errs)} errors, {len(vals)} value | value channel {'set' if VALUE_WEBHOOK_URL else 'NOT SET (log only)'}")
+    sent = _state.setdefault("err_sent", {})
+    pend = _state.setdefault("xapp_pend", {})
+    now_keys = {f"X|{r[0]}|{r[3]:g}" for r in errs}
+    for k in [k for k in pend if k not in now_keys]:
+        del pend[k]
+    for row in sorted(errs, key=lambda r: -r[5]):
+        k = f"X|{row[0]}|{row[3]:g}"
+        if k in sent:
+            continue
+        if k not in pend:                                 # must still be there on the next read (5 min) to post
+            pend[k] = time.time()
+            continue
+        sent[k] = time.time()
+        _xpost("error", *row)
+    day = _now().strftime("%Y-%m-%d")
+    n_today = sum(1 for k in sent if k.startswith(f"V|{day}|"))
+    for row in sorted(vals, key=lambda r: -r[5]):
+        if n_today >= XAPP_VAL_PER_DAY:
+            break
+        k = f"V|{day}|{row[0]}|{row[3]:g}"
+        if k in sent:
+            continue
+        sent[k] = time.time()
+        n_today += 1
+        _xpost("value", *row)
+
+
+_XNAME = {"fant": "Fantasy Score", "pra": "Pts+Rebs+Asts", "pr": "Pts+Rebs", "pa": "Pts+Asts", "ra": "Rebs+Asts", "3pm": "3-Pointers Made",
+          "rushrec": "Rush+Rec Yards", "passrush": "Pass+Rush Yards", "passyds": "Pass Yards", "rushyds": "Rush Yards",
+          "recyds": "Receiving Yards", "rec": "Receptions", "passatt": "Pass Attempts", "passcmp": "Completions",
+          "rushatt": "Rush Attempts", "sog": "Shots On Goal", "saves": "Saves", "hits": "Hits", "blk": "Blocks",
+          "stl": "Steals", "tov": "Turnovers", "pts": "Points", "reb": "Rebounds", "ast": "Assists"}
+
+
+def _xpost(kind, key, have, lo_app, lo, ref, gap):
+    sport, _n, k = key
+    stat = _XNAME.get(k, k)
+    name = next((v[2] for v in have.values() if v[2]), _n)
+    pp = have.get("PRIZEPICKS")
+    icon, dest = ("🚨", ERRORS_WEBHOOK_URL) if kind == "error" else ("💰", VALUE_WEBHOOK_URL)
+    lines = []
+    for app in ("PRIZEPICKS", "UNDERDOG", "SLEEPER"):
+        v = have.get(app)
+        if v:
+            lines.append(f"{app.title()}: {v[0]:g}" + (f" (More {v[3]:g}x / Less {v[4]:g}x)" if app != "PRIZEPICKS" and v[3] else ""))
+    body = "\n".join(lines)
+    print(f"CROSS-APP {kind.upper()}: [{lo_app}] {name} {stat} {lo:g} | {body.replace(chr(10), ' | ')}")
+    if not dest:
+        return
+    when = f"{pp[3] and 'vs ' + pp[3] + ' • '}starts {_start_txt(pp[1])}" if pp else sport
+    embed = {"title": f"{icon} [{lo_app}] {name} — {stat} {lo:g}", "description": body,
+             "color": 15158332 if kind == "error" else 15844367,
+             "fields": [{"name": f"{name} ({sport})", "value": when, "inline": False}],
+             "footer": {"text": "Model v3.0 • alert only • lines move fast, check it's still there"}}
+    _post({"content": f"{icon} **[{lo_app}] {name} — {stat} {lo:g}**"[:1900], "embeds": [embed]}, dest)
+
+
+
+# ====================== BACKGROUND LOOP ======================
+def _fetch_pp():
+    if time.time() < _state.get("pp_block_until", 0):
+        return None
+    try:
+        r = requests.get(PP_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        if r.status_code == 429:
+            _state["pp_block_until"] = time.time() + 120
+            print("HEARTBEAT ERRORS: PrizePicks said slow down (429), pausing 2 minutes")
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("HEARTBEAT ERRORS: PrizePicks error:", e)
+        return None
+
+
+def _load():
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        now = time.time()
+        _state["err_sent"] = {k: t for k, t in d.get("sent", {}).items() if now - t < 36 * 3600}
+    except Exception:
+        _state["err_sent"] = {}
+
+
+def _save():
+    try:
+        now = time.time()
+        sent = {k: t for k, t in _state.get("err_sent", {}).items() if now - t < 36 * 3600}
+        with open(STATE_FILE + ".tmp", "w") as f:
+            json.dump({"sent": sent}, f)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    except Exception:
+        pass
+
+
+def _run():
+    _load()
+    print(f"HEARTBEAT ERRORS started | #error {'set' if ERRORS_WEBHOOK_URL else 'NOT SET'} | "
+          f"#value {'set' if VALUE_WEBHOOK_URL else 'not set (log only)'}")
+    while True:
+        t0 = time.time()
+        raw = _fetch_pp()
+        if raw:
+            try:
+                cross_app_scan(raw)
+            except Exception as e:
+                print("HEARTBEAT ERRORS: cross-app error:", e)
+            try:
+                error_scan(raw)
+            except Exception as e:
+                print("HEARTBEAT ERRORS: line error scan error:", e)
+            del raw
+            gc.collect()
+            _save()
+        time.sleep(max(5.0, EVERY - (time.time() - t0)))
+
+
+def _work(raw):
+    try:
+        if not _state.get("loaded"):
+            _state["loaded"] = True
+            _load()
+            print(f"HEARTBEAT ERRORS on | #error {'set' if ERRORS_WEBHOOK_URL else 'NOT SET'} | "
+                  f"#value {'set' if VALUE_WEBHOOK_URL else 'not set (log only)'}")
+        try:
+            cross_app_scan(raw)
+        except Exception as e:
+            print("HEARTBEAT ERRORS: cross-app error:", e)
+        try:
+            error_scan(raw)
+        except Exception as e:
+            print("HEARTBEAT ERRORS: line error scan error:", e)
+        _save()
+    finally:
+        _state["busy"] = False
+
+
+def check(raw):
+    """Call from Captain Hook's loop with the PrizePicks board it already downloaded (no extra PrizePicks call).
+    Runs in the background, so Captain Hook never waits on it. Skips a turn if the last check is still running."""
+    if not raw or _state.get("busy"):
+        return
+    _state["busy"] = True
+    threading.Thread(target=_work, args=(raw,), name="heartbeat-errors", daemon=True).start()
+
+
+def start():
+    """Call once from Captain Hook's main.py. Safe to call twice (only one loop runs)."""
+    if _state.get("started"):
+        return
+    _state["started"] = True
+    threading.Thread(target=_run, name="heartbeat-errors", daemon=True).start()
+
+
+if __name__ == "__main__":      # can also run on its own: python heartbeat_errors.py
+    _state["started"] = True
+    _run()
+'''
+
+try:
+    import types as _types
+    heartbeat_errors = _types.ModuleType("heartbeat_errors")
+    exec(compile(_HB_ERRORS_SRC, "heartbeat_errors", "exec"), heartbeat_errors.__dict__)
+except Exception as _e:
+    heartbeat_errors = None
+    print(f"#error channel off: {_e}")
 
 
 class DataGap(RuntimeError):
@@ -33,7 +804,13 @@ PROP_DEMONS = os.getenv("PROP_DEMONS", "true").lower() == "true"    # v17: shots
 PROP_PROB = float(os.getenv("PROP_PROB", "0.70"))                    # v16: chance (Poisson) the lean side must have to be juicy
 PROP_MIN_MIN = float(os.getenv("PROP_MIN_MINUTES", "450"))           # v16: needs this many season minutes of data (about 5 full games)
 PROP_RECENT_AGREE = float(os.getenv("PROP_RECENT_AGREE", "0.6"))     # v16: share of his last games that must be on the lean side
-STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles"}
+STAT_LABEL = {"passes": "Passes", "shots": "Shots", "tackles": "Tackles", "saves": "Goalie Saves", "gkfs": "Goalie Fantasy"}
+PROP_SAVES = os.getenv("PROP_SAVES", "true").lower() == "true"            # v28: Goalie Saves picks (juicy only). false = off
+PROP_GK_FANTASY = os.getenv("PROP_GK_FANTASY", "true").lower() == "true"  # v28: Goalie Fantasy Score picks (juicy only). false = off
+GK_PROB = float(os.getenv("GK_PROB", "0.66"))                  # v28: chance a keeper pick must have to be juicy (standard / demon lines)
+GK_GOBLIN_PROB = float(os.getenv("GK_GOBLIN_PROB", "0.75"))    # v28: goblin lines pay less, so they need a higher chance (More only)
+GK_GOBLINS = os.getenv("GK_GOBLINS", "true").lower() == "true" # v28: PrizePicks puts goblins on most saves lines: allowed for keepers
+GK_PAIR = os.getenv("GK_PAIR", "true").lower() == "true"       # v28: saves Over + fantasy Under on the same keeper post as one 🧤 card
 DOM_HOLD = float(os.getenv("DOM_HOLD", "1.30"))   # v22: from this possession ratio the pick is NOT juicy; the post says the mismatch points the other way (Ipswich v Man City). 0 = off
 DOM_WARN = float(os.getenv("DOM_WARN", "1.15"))   # v19: ... from this ratio, a warning on the pick
 BENCH_MIN = float(os.getenv("BENCH_MIN", "60"))   # v20: a player averaging fewer minutes than this is treated as a bench/rotation player
@@ -470,6 +1247,16 @@ def _shots(stat_block):
     return None
 
 
+def _sog(stat_block):
+    for s in stat_block["statistics"]:
+        if s["type"] == "Shots on Goal":
+            try:
+                return int(s["value"] or 0)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _red(stat_block):
     for st in stat_block["statistics"]:
         if st["type"] == "Red Cards":
@@ -503,9 +1290,20 @@ def _form(tid):
             ts = [_shots(b) for b in blocks if b["team"]["id"] != tid]
             mf = [_fouls(b) for b in blocks if b["team"]["id"] == tid]
             tfo = [_fouls(b) for b in blocks if b["team"]["id"] != tid]
+            mo = [_sog(b) for b in blocks if b["team"]["id"] == tid]
+            to = [_sog(b) for b in blocks if b["team"]["id"] != tid]
+            gf = ga = None
+            try:                                                            # v28: goals for / against from the fixture itself
+                home = (f.get("teams") or {}).get("home", {}).get("id") == tid
+                gh, gaw = (f.get("goals") or {}).get("home"), (f.get("goals") or {}).get("away")
+                if gh is not None and gaw is not None:
+                    gf, ga = (gh, gaw) if home else (gaw, gh)
+            except Exception:
+                pass
             rows.append((f["fixture"]["id"], mine[0], theirs[0], red,
                          ms[0] if ms else None, ts[0] if ts else None,     # v16: team shots come with the same stats (no extra calls)
-                         mf[0] if mf else None, tfo[0] if tfo else None))  # v22: team fouls committed / fouls suffered (no extra calls)
+                         mf[0] if mf else None, tfo[0] if tfo else None,   # v22: team fouls committed / fouls suffered (no extra calls)
+                         mo[0] if mo else None, to[0] if to else None, gf, ga))   # v28: shots on target made / allowed, goals for / against
         else:
             nostats += 1
     clean = [r for r in rows if not r[3]]
@@ -516,7 +1314,15 @@ def _form(tid):
     fod = [r[7] for r in use if r[7] is not None]
     shm = [r[4] for r in use if r[4] is not None]
     sha = [r[5] for r in use if r[5] is not None]
+    sotm = [r[8] for r in use if r[8] is not None]
+    sota = [r[9] for r in use if r[9] is not None]
+    gfl = [r[10] for r in use if r[10] is not None]
+    gal = [r[11] for r in use if r[11] is not None]
     return {"made": sum(r[1] for r in use) / len(use),
+            "sot_made": (sum(sotm) / len(sotm)) if len(sotm) >= 3 else None,   # v28: shots on target his team takes per game
+            "sot_allowed": (sum(sota) / len(sota)) if len(sota) >= 3 else None,
+            "gf": (sum(gfl) / len(gfl)) if len(gfl) >= 3 else None,
+            "ga": (sum(gal) / len(gal)) if len(gal) >= 3 else None,
             "allowed": sum(r[2] for r in use) / len(use),
             "sh_made": (sum(shm) / len(shm)) if len(shm) >= 3 else None,         # v16: team shots made / allowed per game
             "sh_allowed": (sum(sha) / len(sha)) if len(sha) >= 3 else None,
@@ -974,6 +1780,169 @@ def lean_count(stat, name, team, opp, line, only_over=False, standard=False):
     return note, ("OVER" if lean_over else "UNDER"), ""
 
 
+# ===== GOALKEEPERS (v28): Goalie Saves + Goalie Fantasy Score =====
+# PrizePicks keeper fantasy: +5 start, +2 per save, -2 per goal conceded, +5 clean sheet (no win bonus).
+# Both props come from the same two numbers: shots on target he will face, and how many of them he stops.
+# Shots on target faced = half his own usual workload + half what this opponent usually puts on target.
+# Each shot on target is a save (his season save %) or a goal, so saves and goals are split from it (Poisson).
+
+def _gk_season(pid):
+    """(saves, goals conceded, minutes, appearances) for his season, only competitions where the API has saves."""
+    data = _pdata(pid)
+    sv = gc = mins = apps = 0
+    for s in (data[0]["statistics"] if data else []):
+        g = s.get("goals") or {}
+        if g.get("saves") is None:
+            continue
+        sv += g.get("saves") or 0
+        gc += g.get("conceded") or 0
+        mins += (s.get("games") or {}).get("minutes") or 0
+        apps += (s.get("games") or {}).get("appearences") or 0
+    return sv, gc, mins, apps
+
+
+def _gk_last(pid, fids):
+    """[(saves, conceded)] in his team's recent games where he played 60+ minutes (cached per fixture)."""
+    out = []
+    for fid in fids:
+        blocks = _cached(("fxp", fid), lambda fid=fid: _get("/fixtures/players", {"fixture": fid}))
+        if blocks is None:
+            raise RuntimeError("daily call cap or rate limit hit while reading keeper games")
+        for team_block in blocks:
+            for pl in team_block["players"]:
+                if pl["player"]["id"] == pid:
+                    st = pl["statistics"][0]
+                    mins = (st.get("games") or {}).get("minutes") or 0
+                    g = st.get("goals") or {}
+                    if mins >= 60 and g.get("saves") is not None:
+                        out.append((g.get("saves") or 0, g.get("conceded") or 0))
+    return out
+
+
+def _gk_fs(s, g):
+    return 5 + 2 * s - 2 * g + (5 if g == 0 else 0)
+
+
+def _pois(mu, k):
+    return math.exp(-mu) * mu ** k / math.factorial(k)
+
+
+def _gk_fs_probs(mu_s, mu_g, line):
+    """(P fantasy > line, P(over) when he concedes 1+, expected fantasy)."""
+    p_over = p_over_goal = p_goal = 0.0
+    ps = [_pois(mu_s, k) for k in range(30)]
+    pg = [_pois(mu_g, k) for k in range(15)]
+    for si, a in enumerate(ps):
+        for gi, b in enumerate(pg):
+            if _gk_fs(si, gi) > line:
+                p_over += a * b
+                if gi >= 1:
+                    p_over_goal += a * b
+    p_goal = 1.0 - pg[0]
+    exp_fs = 5 + 2 * mu_s - 2 * mu_g + 5 * math.exp(-mu_g)
+    return p_over, (p_over_goal / p_goal if p_goal > 0 else 0.0), exp_fs
+
+
+def lean_gk(stat, info):
+    """Goalie Saves / Goalie Fantasy Score. Returns (note, direction_or_False, reason). Posted only when juicy."""
+    if not MATCHUP:
+        return "", False, ""
+    if not KEY:
+        return "", False, "no API-Football key"
+    name, team, opp, line = info["name"], info["team"], info["opp"], float(info["line"])
+    if not team or not opp:
+        return "", False, "PrizePicks gave no team/opponent"
+    odds = info.get("odds") or ""
+    pk, tk, ok = ("player", name, team), ("team", team), ("team", opp)
+    tid = _cached(tk, lambda: _team_id(team))
+    oid = _cached(ok, lambda: _team_id(opp))
+    if not (tid and oid):
+        return "", False, "team: " + _why(tk, ok)
+    fk1, fk2 = ("form", tid), ("form", oid)
+    tf = _cached(fk1, lambda: _form(tid))
+    of = _cached(fk2, lambda: _form(oid))
+    if not (tf and of):
+        return "", False, "recent games: " + _why(fk1, fk2)
+    p = _cached(pk, lambda: _player(name, team, tid))
+    if not p:
+        return "", False, "player: " + _why(pk)
+    pid, _p90, risk = p
+    if (risk.get("pos") or "").lower() != "goalkeeper":
+        return "", False, "matched player is not a keeper"
+    sv, gc, mins, apps = _gk_season(pid)
+    if mins < PROP_MIN_MIN or sv + gc < 10:
+        return "", False, f"only {int(mins)} min of keeper data"
+    if apps and mins / apps < 80:
+        return "", False, "rotation keeper (often not the full game)"
+
+    faced90 = (sv + gc) / (mins / 90)
+    save_pct = max(0.55, min(0.85, (sv + 0.70 * 20) / (sv + gc + 20)))   # pulled toward 70% when he has few games
+    opp_sot = of.get("sot_made")
+    dom_opp = (of["made"] / tf["made"]) if (tf.get("made") and of.get("made")) else 1.0   # >1: the opponent has more of the ball
+    if opp_sot is None:
+        lam, how = faced90, f"faces {faced90:.1f} shots on target a game (no opponent shot data)"
+    else:
+        lam = (faced90 + opp_sot) / 2
+        how = f"usually faces {faced90:.1f} on target, {opp} puts {opp_sot:.1f} on target a game"
+        if dom_opp >= DOM_WARN and lam < faced90:
+            lam = faced90                                     # a giant v a minnow: averages under-sell the pressure (Ipswich v City)
+            how += "; opponent dominates the ball, so no reduction"
+    mu_s = lam * save_pct
+    mu_g = lam * (1 - save_pct) + 0.05
+
+    goblin = odds == "goblin"
+    need = GK_GOBLIN_PROB if goblin else GK_PROB
+    can_under = (not info.get("only_over")) and odds == "standard"
+    l5 = _cached(("gklast", pid, tid), lambda: _gk_last(pid, tf["fids"])) or []
+    warn = ""
+    if stat == "saves":
+        po = _p_over(line, mu_s)
+        pu = 1.0 - po
+        proj = mu_s
+        hist = [a for a, _b in l5]
+    else:
+        po, po_goal, proj = _gk_fs_probs(mu_s, mu_g, line)
+        pu = 1.0 - po
+        hist = [_gk_fs(a, b) for a, b in l5]
+    if po >= need:
+        lean_over, chance = True, po
+    elif can_under and pu >= need:
+        lean_over, chance = False, pu
+    else:
+        return "", False, ""
+    if len(hist) >= 3:
+        hits = sum(1 for x in hist if (x > line) == lean_over)
+        if hits / len(hist) < PROP_RECENT_AGREE:
+            _suppressed["n"] += 1
+            return "", False, ""                               # recent games disagree: stay quiet
+    cs = math.exp(-mu_g)
+    if stat == "gkfs":
+        if not lean_over and cs >= 0.25:
+            warn = (f"\n   ⚠️ Clean-sheet risk: {cs * 100:.0f}% chance of a clean sheet (+5 and no goals against). "
+                    f"If that happens the Under almost surely loses.")
+        if lean_over and po_goal < 0.5:
+            warn = (f"\n   ⚠️ Leans on a clean sheet: if he concedes even 1 goal the Over hits only {po_goal * 100:.0f}% "
+                    f"(each goal is −2 and kills the +5).")
+    if lean_over and 1 / max(dom_opp, 1e-6) >= DOM_WARN and stat == "saves":
+        warn += "\n   ⚠️ His team usually has more of the ball: he may not be tested much."
+    hist_txt = ""
+    if len(hist) >= 3:
+        hist_txt = (f"\n   • Last {len(hist)} games: {', '.join(str(x) for x in hist)}"
+                    f" → over {line:g} in {sum(1 for x in hist if x > line)}/{len(hist)}")
+    tag = "🔥 JUICY — lean OVER" if lean_over else "🧊 JUICY — lean UNDER"
+    gob = " (goblin line, More only)" if goblin else ""
+    if stat == "saves":
+        body = f"\n   • Faces ~{lam:.1f} shots on target ({how}) × {save_pct * 100:.0f}% saved"
+        label = "saves"
+    else:
+        body = (f"\n   • Expected {mu_s:.1f} saves (+{2 * mu_s:.1f}), {mu_g:.1f} goals against (−{2 * mu_g:.1f}), "
+                f"clean sheet {cs * 100:.0f}% (+{5 * cs:.1f}), +5 start\n   • {how}")
+        label = "fantasy pts"
+    note = (f"\n   📊 Proj **{proj:.1f}** {label} vs line {line:g}{gob} → {tag} ({chance * 100:.0f}% chance)"
+            f"{body}{hist_txt}{warn}")
+    return note, ("OVER" if lean_over else "UNDER"), ""
+
+
 # ===== TEAMS FROM THE FIXTURE (v20) =====
 # A name search guesses: "Estudiantes", "Salzburg", "R. Union SG", "Hazem", "Portland" can each be several clubs (or none).
 # The match itself settles it: one call lists every fixture on that date, and the game whose two sides match BOTH PrizePicks
@@ -1079,6 +2048,13 @@ def lean_for(info):
             note += "\n   ℹ️ Under is not offered on this line."
             return note, False, why
         return note, juicy, why
+    if stat in ("saves", "gkfs"):                              # v28: keepers
+        if (stat == "saves" and not PROP_SAVES) or (stat == "gkfs" and not PROP_GK_FANTASY):
+            return "", False, ""
+        odds = info.get("odds") or ""
+        if (odds == "goblin" and not GK_GOBLINS) or (odds == "demon" and not PROP_DEMONS):
+            return "", False, ""
+        return lean_gk(stat, info)
     if stat == "shots" and not PROP_SHOTS:
         _warm_player(info)                                      # v22: no shots picks; only gather data for the Pick6 fouls guide
         return "", False, ""
@@ -1143,6 +2119,10 @@ def parse(data):
                 kind = "shots"
             elif PROP_TACKLES and stat == "tackles":
                 kind = "tackles"
+            elif PROP_SAVES and "save" in stat:                  # v28: "Goalie Saves"
+                kind = "saves"
+            elif PROP_GK_FANTASY and "fantasy" in stat and ("goalie" in stat or "goalkeeper" in stat or "gk" in stat):
+                kind = "gkfs"                                    # v28: "Goalie Fantasy Score"
             else:
                 continue
 
@@ -1220,8 +2200,57 @@ def _dir_prefix(direction):
     return ""
 
 
+def _route(embed, juicy):
+    """Juicy embeds go to the juicy channel (main channel too if JUICY_ALSO_MAIN, or if the juicy post fails)."""
+    sent_juicy = False
+    if JUICY_WEBHOOK_URL and juicy:
+        try:
+            rj = _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
+            sent_juicy = rj is not None and rj.status_code < 300
+        except Exception as e:
+            print("juicy channel post failed:", e)
+    if not sent_juicy or JUICY_ALSO_MAIN or not juicy:
+        _post({"username": "Captain Hook", "embeds": [embed]})
+
+
+def _gk_pairs(props):
+    """v28: a keeper with a juicy saves OVER and a juicy fantasy UNDER (same game script: peppered, but concedes) -> one 🧤 card."""
+    if not GK_PAIR:
+        return props
+    by = defaultdict(dict)
+    for p in props:
+        if p.get("stat") in ("saves", "gkfs") and p.get("juicy"):
+            by[(p["name"], p.get("game_name", ""))][(p["stat"], p["juicy"])] = p
+    used = set()
+    for (name, game), d in by.items():
+        a, b = d.get(("saves", "OVER")), d.get(("gkfs", "UNDER"))
+        if not (a and b):
+            continue
+        used.update({id(a), id(b)})
+        for x in (a, b):
+            try:
+                _track(x)
+            except Exception as e:
+                print("recap tracking failed:", e)
+        team = a.get("team") or ""
+        desc = (f"**{game}**\n🧤 **{name}**{' (' + team + ')' if team else ''} vs {a.get('opp', '')}\n\n"
+                f"🔥 **Saves OVER** `{a['line']}`{a['note']}\n\n🧊 **Fantasy UNDER** `{b['line']}`{b['note']}\n\n"
+                f"Same game script: he gets peppered (saves pile up) but concedes (each goal −2 and no clean sheet +5). "
+                f"Risk: a clean sheet sinks the Under.")
+        embed = {"title": "🧤 Captain Hook — KEEPER PAIR (Saves Over + Fantasy Under)", "description": desc[:4000],
+                 "color": 15105570,
+                 "fields": [{"name": "Starts", "value": format_start_time(a.get("game_start", "")), "inline": False}],
+                 "footer": {"text": f"PrizePicks • 2 props • {INSTANCE}"},
+                 "timestamp": datetime.now(timezone.utc).isoformat()}
+        _route(embed, True)
+    return [p for p in props if id(p) not in used]
+
+
 def send_grouped_embeds(props_to_send):
     if not WEBHOOK_URL or not props_to_send:
+        return
+    props_to_send = _gk_pairs(props_to_send)
+    if not props_to_send:
         return
 
     grouped = defaultdict(list)
@@ -1252,15 +2281,7 @@ def send_grouped_embeds(props_to_send):
             "footer": {"text": f"PrizePicks • {len(props)} prop(s) • {INSTANCE}"},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        sent_juicy = False
-        if JUICY_WEBHOOK_URL and direction:               # v13: juicy picks go to the juicy channel (non-juicy rows have no direction)
-            try:
-                rj = _post({"username": "Captain Hook", "embeds": [embed]}, JUICY_WEBHOOK_URL)
-                sent_juicy = rj is not None and rj.status_code < 300
-            except Exception as e:
-                print("juicy channel post failed:", e)
-        if not sent_juicy or JUICY_ALSO_MAIN or not direction:    # juicy picks skip the main channel, unless the juicy post failed (nothing is ever lost)
-            _post({"username": "Captain Hook", "embeds": [embed]})
+        _route(embed, direction)                          # v13: juicy picks go to the juicy channel (nothing is ever lost)
 
 
 SWEEP_MINUTES = int(os.getenv("SWEEP_MINUTES", "120"))          # how often to re-check the WHOLE board
@@ -1351,8 +2372,8 @@ def sweep(cur, already, silent=False):
                f"(🔥 {sum(1 for i in juicy_items if i['juicy'] == 'OVER')} over, "
                f"🧊 {sum(1 for i in juicy_items if i['juicy'] == 'UNDER')} under)")
         by_stat = {k: sum(1 for i in juicy_items if i.get("stat", "passes") == k) for k in STAT_LABEL}
-        if by_stat["shots"] or by_stat["tackles"]:
-            msg += f"\n   by prop: passes {by_stat['passes']}, shots {by_stat['shots']}, tackles {by_stat['tackles']}"
+        if any(n for k, n in by_stat.items() if k != "passes"):
+            msg += "\n   by prop: " + ", ".join(f"{STAT_LABEL[k].lower()} {n}" for k, n in by_stat.items() if n or k == "passes")
         if reasons:
             top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
             msg += "\nNo matchup data for " + str(sum(reasons.values())) + ": " + ", ".join(f"{n}× {r}" for r, n in top)
@@ -1889,7 +2910,14 @@ def main():
     while True:
         time.sleep(60)
         try:
-            cur = parse(fetch())
+            board = fetch()
+            cur = parse(board)
+            if heartbeat_errors:                       # v26: same board, checked in the background
+                try:
+                    heartbeat_errors.check(board)
+                except Exception as e:
+                    print(f"#error check failed: {e}")
+            del board
             to_send = []
             for _id, info in cur.items():
                 is_new = _id not in seen
